@@ -1,0 +1,11 @@
+# All these folders are examples and collected this way by upstream.
+python-quart-doc: repeated-path-segment api [usr/share/doc/python3-quart/examples/api/src/api/]
+python-quart-doc: repeated-path-segment blog [usr/share/doc/python3-quart/examples/blog/src/blog/]
+python-quart-doc: repeated-path-segment chat [usr/share/doc/python3-quart/examples/chat/src/chat/]
+python-quart-doc: repeated-path-segment video [usr/share/doc/python3-quart/examples/video/src/video/]
+
+# Intended by sphinx design, we ship the source of the HTML data.
+python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.flask_patch.html]
+python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.wrappers.base.html]
+python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.wrappers.html]
+python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.wrappers.response.html]
