@@ -1,5 +1,91 @@
-template-repository (1.0-1) unstable; urgency=medium
+quart (0.18.3-2) unstable; urgency=medium
 
-  * Initial release
+  * Team upload
+  * d/control: Update some B-D by adding BuildProfileSpecs
+  * d/u/metadata: Add fields Documentation, Security-Contact
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Fri, 02 Dec 2022 20:13:00 +0100
+
+quart (0.18.3-1) experimental; urgency=medium
+
+  * Team upload
+
+  [ Stefano Rivera ]
+  * New upstream release.
+  * Upstream now builds with poetry.
+
+  [ Carsten Schoenert ]
+  * d/gbp.conf: Set debian branch to debian/master
+  * New upstream version 0.18.3
+    (Closes: #1020729)
+  * d/control: Update upstream Homepage URL
+    The upstream project has moved to the umbrella of Pallets and lives now on
+    GitHub.
+  * d/copyright: Update upstream data
+  * d/watch: Update url to watch on
+  * d/control: Increase Standards-Version to 4.6.1
+    No further modifications needed.
+  * d/control: Adding entry Rules-Requires-Root: no
+    No needs for root privileges while building.
+  * d/control: Increase werkzeug version in Build-Depends
+    The library si depending on werkzeug 2.2+ onwards
+  * d/control: Update entries on python-quart-doc
+  * d/u/metadata: Update entries due upstream project changes
+    Reflect the changes given by the movement of the project home.
+  * d/control: Sort binary packages alphabetical
+  * d/rules: Adjust the target for dh_auto_build
+  * python-quart-doc: Use dh_sphinxdoc for package build
+  * d/rules: Adopt upstream changes into dh_installchangelogs
+  * Lintian: Adding a override about the source
+  * Lintian: Some overrides for python-quart-doc
+  * d/control: Drop obsolete entry X-Python3-Version
+  * d/README.source: Adding base information about source
+  * autopkgtest: Run upstream tests for basic testing
+
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Tue, 18 Oct 2022 07:49:28 +0200
+
+quart (0.14.1-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Bump debhelper from old 12 to 13.
+  * Set upstream metadata fields: Repository, Repository-Browse.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Fri, 26 Feb 2021 10:08:51 +0100
+
+quart (0.13.1-1) unstable; urgency=medium
+
+  [ Andrej Shadura ]
+  * New upstream release.
+  * Drop dependency on python3-asynctest.
+
+  [ Ondřej Nový ]
+  * Update Maintainer field with new Debian Python Team contact address.
+  * Update Vcs-* fields with new Debian Python Team Salsa layout.
+  * Use https protocol in the watch file.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Tue, 29 Sep 2020 09:33:23 +0200
+
+quart (0.13.0-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Mon, 20 Jul 2020 20:16:24 +0200
+
+quart (0.12.0-2) unstable; urgency=medium
+
+  * Adjust Sphinx theme patching code (Closes: #965013).
+
+ -- Andrej Shadura <andrewsh@debian.org>  Sat, 18 Jul 2020 11:41:53 +0200
+
+quart (0.12.0-1) unstable; urgency=medium
+
+  * Upload to unstable.
+  * New upstream release.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Tue, 14 Jul 2020 10:44:16 +0200
+
+quart (0.11.3-1) experimental; urgency=low
+
+  * Initial packaging (Closes: #953885).
+
+ -- Andrej Shadura <andrewsh@debian.org>  Mon, 16 Mar 2020 15:52:09 +0100

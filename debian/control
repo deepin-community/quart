@@ -1,15 +1,84 @@
-Source: template-repository
-Section: unknown
+Source: quart
+Maintainer: Debian Python Team <team+python@tracker.debian.org>
+Uploaders:
+ Andrej Shadura <andrewsh@debian.org>,
+Section: python
 Priority: optional
-Maintainer: Tsic404 <liuheng@deepin.org>
-Build-Depends: debhelper (>= 11)
-Standards-Version: 4.1.3
-Homepage: https://github.com/deepin-community/template-repository
-#Vcs-Browser: https://salsa.debian.org/debian/deepin-community-template-repository
-#Vcs-Git: https://salsa.debian.org/debian/deepin-community-template-repository.git
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-sequence-python3,
+ pybuild-plugin-pyproject,
+ python3-aiofiles,
+ python3-all (>= 3.7),
+ python3-blinker,
+ python3-click,
+ python3-dotenv,
+ python3-hypercorn (>= 0.11.2~),
+ python3-hypothesis,
+ python3-itsdangerous,
+ python3-jinja2,
+ python3-markupsafe,
+ python3-poetry,
+ python3-pytest <!nocheck>,
+ python3-pytest-asyncio <!nocheck>,
+ python3-pytest-cov <!nocheck>,
+ python3-sphinx <!nodoc>,
+ python3-sphinx-rtd-theme <!nodoc>,
+ python3-toml,
+ python3-werkzeug (>= 2.2.0~),
+Rules-Requires-Root: no
+Standards-Version: 4.6.1
+Testsuite: autopkgtest-pkg-python
+Homepage: https://github.com/pallets/quart
+Vcs-Browser: https://salsa.debian.org/python-team/packages/quart
+Vcs-Git: https://salsa.debian.org/python-team/packages/quart.git
 
-Package: template-repository
-Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: <insert up to 60 chars description>
- <insert long description, indented with spaces>
+Package: python-quart-doc
+Section: doc
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${sphinxdoc:Depends},
+Multi-Arch: foreign
+Description: Python ASGI web microframework with the same API as Flask (Documentation)
+ Quart is a Python ASGI web microframework. It is intended to provide the
+ easiest way to use asyncio functionality in a web context, especially
+ with existing Flask apps. This is possible as the Quart API is a superset
+ of the Flask API.
+ .
+ Quart aims to be a complete web microframework, as it supports HTTP/1.1,
+ HTTP/2 and websockets. Quart is very extendable and has a number of
+ known extensions and works with many of the Flask extensions.
+ .
+ Quart supports the full ASGI 3.0 specification as well as the websocket
+ response and HTTP/2 server push extensions. For those of you familiar
+ with Flask, Quart extends the Flask API by adding support for:
+ .
+  * HTTP/1.1 request streaming
+  * Websockets
+  * HTTP/2 server push
+ .
+ This package contains the documentation and examples.
+
+Package: python3-quart
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+Description: Python ASGI web microframework with the same API as Flask
+ Quart is a Python ASGI web microframework. It is intended to provide the
+ easiest way to use asyncio functionality in a web context, especially
+ with existing Flask apps. This is possible as the Quart API is a superset
+ of the Flask API.
+ .
+ Quart aims to be a complete web microframework, as it supports HTTP/1.1,
+ HTTP/2 and websockets. Quart is very extendable and has a number of
+ known extensions and works with many of the Flask extensions.
+ .
+ Quart supports the full ASGI 3.0 specification as well as the websocket
+ response and HTTP/2 server push extensions. For those of you familiar
+ with Flask, Quart extends the Flask API by adding support for:
+ .
+  * HTTP/1.1 request streaming
+  * Websockets
+  * HTTP/2 server push

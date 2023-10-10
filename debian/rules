@@ -1,4 +1,44 @@
 #!/usr/bin/make -f
+# -*- makefile -*-
+
+#export DH_VERBOSE = 1
+export PYBUILD_NAME=quart
+
+include /usr/share/dpkg/pkg-info.mk
+
+BUILD_DATE  = $(shell LC_ALL=C date -u "+%d %B %Y" -d "@$(SOURCE_DATE_EPOCH)")
+SPHINXOPTS := -N -D html_last_updated_fmt="$(BUILD_DATE)"
 
 %:
-	dh $@
+	dh $@ --with sphinxdoc --buildsystem=pybuild
+
+override_dh_sphinxdoc:
+ifeq (,$(findstring nodoc, $(DEB_BUILD_OPTIONS)))
+	sed -i 's,pydata_sphinx_theme,sphinx_rtd_theme,g' docs/conf.py
+	PYTHONPATH=`dirname $$(find .pybuild/ -type d -name "quart*dist-info" | head -n1)` \
+	    python3 -m sphinx -b html $(SPHINXOPTS) docs $(CURDIR)/debian/python-quart-doc/usr/share/doc/python-quart-doc/html
+	dh_sphinxdoc
+endif
+
+override_dh_installdocs:
+	dh_installdocs -ppython-$(PYBUILD_NAME)-doc --doc-main-package=python3-$(PYBUILD_NAME)
+	dh_installdocs --remaining-packages
+
+override_dh_auto_build:
+	# The name of the project need to be written in lowercase letters,
+	# otherwise pybuild wont find the WHEEL file (as it's created from the
+	# project name starting with an capital letter.
+	sed -i 's,name = "Quart",name = "quart",g' pyproject.toml
+	dh_auto_build
+
+override_dh_installexamples:
+	dh_installexamples -ppython-$(PYBUILD_NAME)-doc --doc-main-package=python3-$(PYBUILD_NAME)
+	dh_installexamples --remaining-packages
+
+override_dh_installchangelogs:
+	dh_installchangelogs CHANGES.rst
+
+override_dh_compress:
+	dh_compress -X.py
+
+.PHONY: override_dh_auto_build override_dh_auto_clean override_dh_installdocs override_dh_installexamples override_dh_installchangelogs override_dh_compress
