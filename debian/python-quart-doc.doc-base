@@ -1,0 +1,8 @@
+Document: python-quart-doc
+Title: Fast Python web microframework
+Abstract: Quart is an asyncio reimplementation of the popular Flask microframework API.
+Section: Programming/Python
+
+Format: HTML
+Index: /usr/share/doc/python-quart-doc/html/index.html
+Files: /usr/share/doc/python-quart-doc/html/*.html
