@@ -1,3 +1,9 @@
+quart (0.18.3-2deepin1) unstable; urgency=medium
+
+  * fix  No module named 'py._path'; 'py' is not a package.
+
+ -- LiChengGang <lichenggang@uniontech.com>  Wed, 22 Nov 2023 09:37:34 +0800
+
 quart (0.18.3-2) unstable; urgency=medium
 
   * Team upload
