@@ -9,7 +9,7 @@ server.
 
 This tutorial is meant to serve as an introduction to WebSockets in
 Quart. If you want to skip to the end the code is on `Github
-<https://github.com/pgjones/quart/example/chat>`_.
+<https://github.com/pallets/quart/tree/main/examples/chat>`_.
 
 1: Creating the project
 -----------------------
@@ -84,7 +84,7 @@ Which allows the following command to start the app:
 
 When users visit our chat website we will need to show them a UI which
 they can use to enter and receive messages. The following HTML
-template should be added to *src/chat/templatest/index.html*:
+template should be added to *src/chat/templates/index.html*:
 
 .. code-block:: html
     :caption: src/chat/templates/index.html

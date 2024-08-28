@@ -1,45 +1,44 @@
 Source: quart
 Maintainer: Debian Python Team <team+python@tracker.debian.org>
-Uploaders:
- Andrej Shadura <andrewsh@debian.org>,
+Uploaders: Andrej Shadura <andrewsh@debian.org>
 Section: python
-Priority: optional
-Build-Depends:
- debhelper-compat (= 13),
- dh-sequence-python3,
- pybuild-plugin-pyproject,
- python3-aiofiles,
- python3-all (>= 3.7),
- python3-blinker,
- python3-click,
- python3-dotenv,
- python3-hypercorn (>= 0.11.2~),
- python3-hypothesis,
- python3-itsdangerous,
- python3-jinja2,
- python3-markupsafe,
- python3-poetry,
- python3-pytest <!nocheck>,
- python3-pytest-asyncio <!nocheck>,
- python3-pytest-cov <!nocheck>,
- python3-sphinx <!nodoc>,
- python3-sphinx-rtd-theme <!nodoc>,
- python3-toml,
- python3-werkzeug (>= 2.2.0~),
-Rules-Requires-Root: no
-Standards-Version: 4.6.1
 Testsuite: autopkgtest-pkg-python
-Homepage: https://github.com/pallets/quart
+Priority: optional
+Build-Depends: debhelper-compat (= 13),
+               dh-sequence-python3,
+               pybuild-plugin-pyproject,
+               python3-aiofiles,
+               python3-all,
+               python3-blinker,
+               python3-click,
+               python3-dotenv,
+               python3-flask <!nodoc>,
+               python3-hypercorn,
+               python3-hypothesis,
+               python3-itsdangerous,
+               python3-jinja2,
+               python3-markupsafe,
+               python3-poetry,
+               python3-poetry-core,
+               python3-pytest <!nocheck>,
+               python3-pytest-asyncio <!nocheck>,
+               python3-pytest-cov <!nocheck>,
+               python3-sphinx <!nodoc>,
+               python3-sphinx-rtd-theme <!nodoc>,
+               python3-toml,
+               python3-werkzeug (>= 2.2.0~),
+Standards-Version: 4.7.0
 Vcs-Browser: https://salsa.debian.org/python-team/packages/quart
 Vcs-Git: https://salsa.debian.org/python-team/packages/quart.git
+Homepage: https://github.com/pallets/quart
+Rules-Requires-Root: no
 
 Package: python-quart-doc
-Section: doc
 Architecture: all
-Depends:
- ${misc:Depends},
- ${sphinxdoc:Depends},
 Multi-Arch: foreign
+Section: doc
+Depends: ${misc:Depends},
+         ${sphinxdoc:Depends}
 Description: Python ASGI web microframework with the same API as Flask (Documentation)
  Quart is a Python ASGI web microframework. It is intended to provide the
  easiest way to use asyncio functionality in a web context, especially
@@ -62,9 +61,8 @@ Description: Python ASGI web microframework with the same API as Flask (Document
 
 Package: python3-quart
 Architecture: all
-Depends:
- ${misc:Depends},
- ${python3:Depends},
+Depends: ${misc:Depends},
+         ${python3:Depends}
 Description: Python ASGI web microframework with the same API as Flask
  Quart is a Python ASGI web microframework. It is intended to provide the
  easiest way to use asyncio functionality in a web context, especially

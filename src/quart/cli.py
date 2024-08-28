@@ -13,7 +13,7 @@ import traceback
 from importlib import import_module
 from operator import attrgetter
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 import click
 from click.core import ParameterSource
@@ -166,11 +166,11 @@ def find_app_by_string(module: ModuleType, app_name: str) -> Quart:
         return app
 
     raise NoAppException(
-        "A valid Quart application was not obtained from" f" '{module.__name__}:{app_name}'."
+        f"A valid Quart application was not obtained from '{module.__name__}:{app_name}'."
     )
 
 
-def locate_app(module_name: str, app_name: str) -> Optional[Quart]:
+def locate_app(module_name: str, app_name: str) -> Quart | None:
     try:
         module = import_module(module_name)
     except ImportError:
@@ -222,15 +222,15 @@ def prepare_import(path: str) -> str:
 class ScriptInfo:
     def __init__(
         self,
-        app_import_path: Optional[str] = None,
-        create_app: Optional[Callable[..., Quart]] = None,
+        app_import_path: str | None = None,
+        create_app: Callable[..., Quart] | None = None,
         set_debug_flag: bool = True,
     ) -> None:
         self.app_import_path = app_import_path
         self.create_app = create_app
-        self.data: Dict[Any, Any] = {}
+        self.data: dict[Any, Any] = {}
         self.set_debug_flag = set_debug_flag
-        self._loaded_app: Optional[Quart] = None
+        self._loaded_app: Quart | None = None
 
     def load_app(self) -> Quart:
         if self._loaded_app is not None:
@@ -267,7 +267,7 @@ class ScriptInfo:
 pass_script_info = click.make_pass_decorator(ScriptInfo, ensure=True)
 
 
-def with_appcontext(fn: Optional[Callable] = None) -> Callable:
+def with_appcontext(fn: Callable | None = None) -> Callable:
     # decorator was used with parenthesis
     if fn is None:
         return with_appcontext
@@ -372,29 +372,6 @@ _app_option = click.Option(
 )
 
 
-def _set_env(ctx: click.Context, param: click.Option, value: str | None) -> str | None:
-    if value is None:
-        return None
-
-    # Set with env var instead of ScriptInfo.load so that it can be
-    # accessed early during a factory function.
-    os.environ["QUART_ENV"] = value
-    return value
-
-
-_env_option = click.Option(
-    ["-E", "--env"],
-    metavar="NAME",
-    help=(
-        "The execution environment name to set in 'app.env'. Defaults to"
-        " 'production'. 'development' will enable 'app.debug' and start the"
-        " debugger and reloader when running the server."
-    ),
-    expose_value=False,
-    callback=_set_env,
-)
-
-
 def _set_debug(ctx: click.Context, param: click.Option, value: bool) -> bool | None:
     # If the flag isn't provided, it will default to False. Don't use
     # that, let debug be set by env in that case.
@@ -468,7 +445,7 @@ class QuartGroup(AppGroup):
         # callback. This allows users to make a custom group callback
         # without losing the behavior. --env-file must come first so
         # that it is eagerly evaluated before --app.
-        params.extend((_env_file_option, _app_option, _env_option, _debug_option))
+        params.extend((_env_file_option, _app_option, _debug_option))
 
         if add_version_option:
             params.append(version_option)
@@ -526,9 +503,9 @@ class QuartGroup(AppGroup):
             click.secho(f"Error: {e.format_message()}\n", err=True, fg="red")
             return None
 
-        return app.cli.get_command(ctx, name)  # type: ignore
+        return app.cli.get_command(ctx, name)
 
-    def list_commands(self, ctx: click.Context) -> List[str]:
+    def list_commands(self, ctx: click.Context) -> list[str]:
         self._load_plugin_commands()
 
         rv = set(super().list_commands(ctx))
@@ -537,7 +514,7 @@ class QuartGroup(AppGroup):
         # Add commands provided by the app, showing an error and
         # continuing if the app couldn't be loaded.
         try:
-            rv.update(info.load_app().cli.list_commands(ctx))  # type: ignore
+            rv.update(info.load_app().cli.list_commands(ctx))
         except NoAppException as e:
             # When an app couldn't be loaded, show the error message
             # without the traceback.
@@ -675,7 +652,7 @@ def shell_command() -> None:
     """
     banner = (
         f"Python {sys.version} on {sys.platform}\n"
-        f"App: {current_app.import_name} [{current_app.env}]\n"
+        f"App: {current_app.import_name}\n"
         f"Instance: {current_app.instance_path}"
     )
     ctx: dict = {}
@@ -714,7 +691,7 @@ def shell_command() -> None:
 @click.option(
     "--sort",
     "-s",
-    type=click.Choice(("endpoint", "methods", "rule", "match")),
+    type=click.Choice(("endpoint", "methods", "domain", "rule", "match")),
     default="endpoint",
     help=(
         'Method to sort routes by. "match" is the order that Quart will match '
@@ -731,29 +708,35 @@ def routes_command(sort: str, all_methods: bool) -> None:
         click.echo("No routes were registered.")
         return
 
-    ignored_methods = set(() if all_methods else ("HEAD", "OPTIONS"))
+    ignored_methods = set() if all_methods else {"HEAD", "OPTIONS"}
+    host_matching = current_app.url_map.host_matching
+    has_domain = any(rule.host if host_matching else rule.subdomain for rule in rules)
 
-    if sort in ("endpoint", "rule"):
+    if sort in ("endpoint", "rule", "domain"):
         rules = sorted(rules, key=attrgetter(sort))
     elif sort == "methods":
         rules = sorted(rules, key=lambda rule: sorted(rule.methods))
 
-    rule_methods = [", ".join(sorted(rule.methods - ignored_methods)) for rule in rules]
+    headers = ["Endpoint", "Methods"]
+    if has_domain:
+        headers.append("Host" if host_matching else "Subdomain")
+    headers.append("Rule")
 
-    headers = ("Endpoint", "Methods", "Rule")
-    widths = (
-        max(len(rule.endpoint) for rule in rules),
-        max(len(methods) for methods in rule_methods),
-        max(len(rule.rule) for rule in rules),
-    )
-    widths = [max(len(h), w) for h, w in zip(headers, widths)]
-    row = "{{0:<{0}}}  {{1:<{1}}}  {{2:<{2}}}".format(*widths)
+    rows = []
+    for rule in rules:
+        row = [rule.endpoint, ", ".join(sorted(rule.methods - ignored_methods))]
+        if has_domain:
+            row.append((rule.host if host_matching else rule.subdomain) or "")
+        row.append(rule.rule)
+        rows.append(row)
 
-    click.echo(row.format(*headers).strip())
-    click.echo(row.format(*("-" * width for width in widths)))
+    rows.insert(0, headers)
+    widths = [max(len(row[i]) for row in rows) for i in range(len(headers))]
+    rows.insert(1, ["-" * w for w in widths])
+    template = "  ".join(f"{{{i}:<{w}}}" for i, w in enumerate(widths))
 
-    for rule, methods in zip(rules, rule_methods):
-        click.echo(row.format(rule.endpoint, methods, rule.rule).rstrip())
+    for row in rows:
+        click.echo(template.format(*row))
 
 
 cli = QuartGroup(

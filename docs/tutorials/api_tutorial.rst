@@ -9,7 +9,7 @@ response data.
 
 This tutorial is meant to serve as an introduction to building APIs in
 Quart. If you want to skip to the end the code is on `Github
-<https://github.com/pgjones/quart/example/api>`_.
+<https://github.com/pallets/quart/tree/main/examples/api>`_.
 
 1: Creating the project
 -----------------------
@@ -143,7 +143,10 @@ We can then add schemas for a Todo object by adding the following to
     from dataclasses import dataclass
     from datetime import datetime
 
+    from quart import Quart
     from quart_schema import QuartSchema, validate_request, validate_response
+
+    app = Quart(__name__)
 
     QuartSchema(app)
 
@@ -159,7 +162,7 @@ We can then add schemas for a Todo object by adding the following to
     @app.post("/todos/")
     @validate_request(TodoIn)
     @validate_response(Todo)
-    async def create_todo(data: Todo) -> Todo:
+    async def create_todo(data: TodoIn) -> Todo:
         return Todo(id=1, task=data.task, due=data.due)
 
 The OpenAPI schema is then available at

@@ -8,7 +8,6 @@ from typing import Any, AsyncGenerator
 
 import pytest
 from hypothesis import given, strategies as strategies
-from py._path.local import LocalPath
 from werkzeug.datastructures import Headers
 from werkzeug.exceptions import RequestedRangeNotSatisfiable
 
@@ -44,10 +43,10 @@ async def test_iterable_wrapper(iterable: Any) -> None:
     assert results == [b"abc", b"def"]
 
 
-async def test_file_wrapper(tmpdir: LocalPath) -> None:
-    file_ = tmpdir.join("file_wrapper")
-    file_.write("abcdef")
-    wrapper = FileBody(Path(file_.realpath()), buffer_size=3)
+async def test_file_wrapper(tmp_path: Path) -> None:
+    file_ = tmp_path / "file_wrapper"
+    file_.write_text("abcdef")
+    wrapper = FileBody(Path(file_), buffer_size=3)
     results = []
     async with wrapper as response:
         async for data in response:
@@ -98,7 +97,7 @@ async def test_response_make_conditional(http_scope: HTTPScope) -> None:
     assert response.accept_ranges == "bytes"
     assert response.content_range.units == "bytes"
     assert response.content_range.start == 0
-    assert response.content_range.stop == 3
+    assert response.content_range.stop == 4
     assert response.content_range.length == 6
 
 
@@ -128,6 +127,26 @@ async def test_response_make_conditional_out_of_bound(http_scope: HTTPScope) -> 
     await response.make_conditional(request, complete_length=6)
     assert b"abcdef" == (await response.get_data())  # type: ignore
     assert response.status_code == 206
+
+
+async def test_response_make_conditional_not_modified(http_scope: HTTPScope) -> None:
+    response = Response(b"abcdef")
+    await response.add_etag()
+    request = Request(
+        "GET",
+        "https",
+        "/",
+        b"",
+        Headers([("If-None-Match", response.get_etag()[0])]),
+        "",
+        "1.1",
+        http_scope,
+        send_push_promise=no_op_push,
+    )
+    await response.make_conditional(request)
+    assert response.status_code == 304
+    assert b"" == (await response.get_data())  # type: ignore
+    assert "content-length" not in response.headers
 
 
 @pytest.mark.parametrize(

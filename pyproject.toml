@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "Quart"
-version = "0.18.3"
+version = "0.19.6"
 description = "A Python ASGI web microframework with the same API as Flask"
 authors = ["pgjones <philip.graham.jones@googlemail.com>"]
 classifiers = [
@@ -11,10 +11,11 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -25,10 +26,11 @@ repository = "https://github.com/pallets/quart/"
 documentation = "https://quart.palletsprojects.com"
 
 [tool.poetry.dependencies]
-python = ">=3.7"
+python = ">=3.8"
 aiofiles = "*"
-blinker = "*"
+blinker = ">=1.6"
 click = ">=8.0.0"
+flask = ">=3.0.0"
 hypercorn = ">=0.11.2"
 importlib_metadata = { version = "*", python = "<3.10" }
 itsdangerous = "*"
@@ -36,12 +38,11 @@ jinja2 = "*"
 markupsafe = "*"
 pydata_sphinx_theme = { version = "*", optional = true }
 python-dotenv = { version = "*", optional = true }
-typing_extensions = { version = "*", python = "<3.8" }
-werkzeug = ">=2.2.0"
+typing_extensions = { version = "*", python = "<3.10" }
+werkzeug = ">=3.0.0"
 
 [tool.poetry.dev-dependencies]
 hypothesis = "*"
-mock = "*"
 pytest = "*"
 pytest-asyncio = "*"
 
@@ -54,7 +55,7 @@ dotenv = ["python-dotenv"]
 
 [tool.black]
 line-length = 100
-target-version = ["py37"]
+target-version = ["py38"]
 
 [tool.isort]
 combine_as_imports = true

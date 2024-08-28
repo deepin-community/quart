@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from hypercorn.typing import ASGIReceiveEvent, ASGISendEvent, HTTPScope, WebsocketScope
 from werkzeug.datastructures import Headers
 
 from quart import Quart
-from quart.asgi import _convert_version, ASGIHTTPConnection, ASGIWebsocketConnection
+from quart.asgi import (
+    _convert_version,
+    _handle_exception,
+    ASGIHTTPConnection,
+    ASGIWebsocketConnection,
+)
 from quart.utils import encode_headers
-
-try:
-    from unittest.mock import AsyncMock
-except ImportError:
-    # Python < 3.8
-    from mock import AsyncMock  # type: ignore
 
 
 @pytest.mark.parametrize("headers, expected", [([(b"host", b"quart")], "quart"), ([], "")])
@@ -175,6 +174,32 @@ def test_http_path_from_absolute_target() -> None:
     assert request.path == "/path"
 
 
+@pytest.mark.parametrize(
+    "path, expected",
+    [("/app", "/ "), ("/", "/ "), ("/app/", "/"), ("/app/2", "/2")],
+)
+def test_http_path_with_root_path(path: str, expected: str) -> None:
+    app = Quart(__name__)
+    scope: HTTPScope = {
+        "type": "http",
+        "asgi": {},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "path": path,
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "/app",
+        "headers": [(b"host", b"quart")],
+        "client": ("127.0.0.1", 80),
+        "server": None,
+        "extensions": {},
+    }
+    connection = ASGIHTTPConnection(app, scope)
+    request = connection._create_request_from_scope(lambda: None)  # type: ignore
+    assert request.path == expected
+
+
 def test_websocket_path_from_absolute_target() -> None:
     app = Quart(__name__)
     scope: WebsocketScope = {
@@ -198,6 +223,32 @@ def test_websocket_path_from_absolute_target() -> None:
 
 
 @pytest.mark.parametrize(
+    "path, expected",
+    [("/app", "/ "), ("/", "/ "), ("/app/", "/"), ("/app/2", "/2")],
+)
+def test_websocket_path_with_root_path(path: str, expected: str) -> None:
+    app = Quart(__name__)
+    scope: WebsocketScope = {
+        "type": "websocket",
+        "asgi": {},
+        "http_version": "1.1",
+        "scheme": "wss",
+        "path": path,
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "/app",
+        "headers": [(b"host", b"quart")],
+        "client": ("127.0.0.1", 80),
+        "server": None,
+        "subprotocols": [],
+        "extensions": {"websocket.http.response": {}},
+    }
+    connection = ASGIWebsocketConnection(app, scope)
+    websocket = connection._create_websocket_from_scope(lambda: None)  # type: ignore
+    assert websocket.path == expected
+
+
+@pytest.mark.parametrize(
     "scope, headers, subprotocol, has_headers",
     [
         ({}, Headers(), None, False),
@@ -207,7 +258,7 @@ def test_websocket_path_from_absolute_target() -> None:
     ],
 )
 async def test_websocket_accept_connection(
-    scope: dict, headers: Headers, subprotocol: Optional[str], has_headers: bool
+    scope: dict, headers: Headers, subprotocol: str | None, has_headers: bool
 ) -> None:
     connection = ASGIWebsocketConnection(Quart(__name__), scope)  # type: ignore
     mock_send = AsyncMock()
@@ -233,7 +284,7 @@ async def test_websocket_accept_connection_warns(websocket_scope: WebsocketScope
     async def mock_send(message: ASGISendEvent) -> None:
         pass
 
-    with pytest.warns(None):
+    with pytest.warns(UserWarning):
         await connection.accept_connection(mock_send, Headers({"a": "b"}), None)
 
 
@@ -255,3 +306,25 @@ def test_http_asgi_scope_from_request() -> None:
     connection = ASGIHTTPConnection(app, scope)  # type: ignore
     request = connection._create_request_from_scope(lambda: None)  # type: ignore
     assert request.scope["test_result"] == "PASSED"  # type: ignore
+
+
+@pytest.mark.parametrize(
+    "propagate_exceptions, testing, raises",
+    [
+        (True, False, False),
+        (True, True, True),
+        (False, True, True),
+        (False, False, True),
+    ],
+)
+async def test__handle_exception(propagate_exceptions: bool, testing: bool, raises: bool) -> None:
+    app = Mock()
+    app.config = {}
+    app.config["PROPAGATE_EXCEPTIONS"] = propagate_exceptions
+    app.testing = testing
+
+    if raises:
+        with pytest.raises(ValueError):
+            await _handle_exception(app, ValueError())
+    else:
+        await _handle_exception(app, ValueError())

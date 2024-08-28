@@ -14,7 +14,6 @@ SPHINXOPTS := -N -D html_last_updated_fmt="$(BUILD_DATE)"
 
 override_dh_sphinxdoc:
 ifeq (,$(findstring nodoc, $(DEB_BUILD_OPTIONS)))
-	sed -i 's,pydata_sphinx_theme,sphinx_rtd_theme,g' docs/conf.py
 	PYTHONPATH=`dirname $$(find .pybuild/ -type d -name "quart*dist-info" | head -n1)` \
 	    python3 -m sphinx -b html $(SPHINXOPTS) docs $(CURDIR)/debian/python-quart-doc/usr/share/doc/python-quart-doc/html
 	dh_sphinxdoc
@@ -27,9 +26,13 @@ override_dh_installdocs:
 override_dh_auto_build:
 	# The name of the project need to be written in lowercase letters,
 	# otherwise pybuild wont find the WHEEL file (as it's created from the
-	# project name starting with an capital letter.
+	# project name starting with an capital letter).
 	sed -i 's,name = "Quart",name = "quart",g' pyproject.toml
 	dh_auto_build
+	# Now undo the previous replacement again, we need to do this hack as
+	# dpkg will otherwise complain about modified source code of course in
+	# case the build is getting started twice in a row.
+	sed -i 's,name = "quart",name = "Quart",g' pyproject.toml
 
 override_dh_installexamples:
 	dh_installexamples -ppython-$(PYBUILD_NAME)-doc --doc-main-package=python3-$(PYBUILD_NAME)
@@ -40,5 +43,11 @@ override_dh_installchangelogs:
 
 override_dh_compress:
 	dh_compress -X.py
+
+override_dh_clean:
+	rm -rf .pybuild \
+	       .mypy_cache \
+	       docs/reference/source/*
+	dh_clean
 
 .PHONY: override_dh_auto_build override_dh_auto_clean override_dh_installdocs override_dh_installexamples override_dh_installchangelogs override_dh_compress

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 from functools import partial
-from typing import AnyStr, cast, List, Optional, Set, TYPE_CHECKING, Union
+from typing import AnyStr, cast, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 
 from hypercorn.typing import (
@@ -28,7 +28,8 @@ from werkzeug.wrappers import Response as WerkzeugResponse
 
 from .debug import traceback_response
 from .signals import websocket_received, websocket_sent
-from .utils import encode_headers
+from .typing import ResponseTypes
+from .utils import cancel_tasks, encode_headers, raise_task_exceptions
 from .wrappers import Request, Response, Websocket  # noqa: F401
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 
 
 class ASGIHTTPConnection:
-    def __init__(self, app: "Quart", scope: HTTPScope) -> None:
+    def __init__(self, app: Quart, scope: HTTPScope) -> None:
         self.app = app
         self.scope = scope
 
@@ -47,8 +48,8 @@ class ASGIHTTPConnection:
         done, pending = await asyncio.wait(
             [handler_task, receiver_task], return_when=asyncio.FIRST_COMPLETED
         )
-        await _cancel_tasks(pending)
-        _raise_exceptions(done)
+        await cancel_tasks(pending)
+        raise_task_exceptions(done)
 
     async def handle_messages(self, request: Request, receive: ASGIReceiveCallable) -> None:
         while True:
@@ -70,6 +71,13 @@ class ASGIHTTPConnection:
 
         path = self.scope["path"]
         path = path if path[0] == "/" else urlparse(path).path
+        root_path = self.scope.get("root_path", "")
+        if root_path != "":
+            try:
+                path = path.split(root_path, 1)[1]
+                path = " " if path == "" else path
+            except IndexError:
+                path = " "  # Invalid in paths, hence will result in 404
 
         return self.app.request_class(
             self.scope["method"],
@@ -88,11 +96,8 @@ class ASGIHTTPConnection:
     async def handle_request(self, request: Request, send: ASGISendCallable) -> None:
         try:
             response = await self.app.handle_request(request)
-        except Exception:
-            if self.app.propagate_exceptions:
-                response = await traceback_response()
-            else:
-                raise
+        except Exception as error:
+            response = await _handle_exception(self.app, error)
 
         if isinstance(response, Response) and response.timeout != Ellipsis:
             timeout = cast(Optional[float], response.timeout)
@@ -103,9 +108,7 @@ class ASGIHTTPConnection:
         except asyncio.TimeoutError:
             pass
 
-    async def _send_response(
-        self, send: ASGISendCallable, response: Union[Response, WerkzeugResponse]
-    ) -> None:
+    async def _send_response(self, send: ASGISendCallable, response: ResponseTypes) -> None:
         await send(
             cast(
                 HTTPResponseStartEvent,
@@ -119,7 +122,7 @@ class ASGIHTTPConnection:
 
         if isinstance(response, WerkzeugResponse):
             for data in response.response:
-                body = data.encode(response.charset) if isinstance(data, str) else data
+                body = data.encode() if isinstance(data, str) else data
                 await send(
                     cast(
                         HTTPResponseBodyEvent,
@@ -129,7 +132,7 @@ class ASGIHTTPConnection:
         else:
             async with response.response as response_body:
                 async for data in response_body:
-                    body = data.encode(response.charset) if isinstance(data, str) else data
+                    body = data.encode() if isinstance(data, str) else data
                     await send(
                         cast(
                             HTTPResponseBodyEvent,
@@ -144,14 +147,15 @@ class ASGIHTTPConnection:
         )
 
     async def _send_push_promise(self, send: ASGISendCallable, path: str, headers: Headers) -> None:
-        if "http.response.push" in self.scope.get("extensions", {}):
+        extensions = self.scope.get("extensions", {}) or {}
+        if "http.response.push" in extensions:
             await send(
                 {"type": "http.response.push", "path": path, "headers": encode_headers(headers)}
             )
 
 
 class ASGIWebsocketConnection:
-    def __init__(self, app: "Quart", scope: WebsocketScope) -> None:
+    def __init__(self, app: Quart, scope: WebsocketScope) -> None:
         self.app = app
         self.scope = scope
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -165,15 +169,15 @@ class ASGIWebsocketConnection:
         done, pending = await asyncio.wait(
             [handler_task, receiver_task], return_when=asyncio.FIRST_COMPLETED
         )
-        await _cancel_tasks(pending)
-        _raise_exceptions(done)
+        await cancel_tasks(pending)
+        raise_task_exceptions(done)
 
     async def handle_messages(self, receive: ASGIReceiveCallable) -> None:
         while True:
             event = await receive()
             if event["type"] == "websocket.receive":
                 message = event.get("bytes") or event["text"]
-                await websocket_received.send(message)
+                await websocket_received.send_async(message)
                 await self.queue.put(message)
             elif event["type"] == "websocket.disconnect":
                 return
@@ -186,6 +190,13 @@ class ASGIWebsocketConnection:
 
         path = self.scope["path"]
         path = path if path[0] == "/" else urlparse(path).path
+        root_path = self.scope.get("root_path", "")
+        if root_path != "":
+            try:
+                path = path.split(root_path, 1)[1]
+                path = " " if path == "" else path
+            except IndexError:
+                path = " "  # Invalid in paths, hence will result in 404
 
         return self.app.websocket_class(
             path,
@@ -205,14 +216,12 @@ class ASGIWebsocketConnection:
     async def handle_websocket(self, websocket: Websocket, send: ASGISendCallable) -> None:
         try:
             response = await self.app.handle_websocket(websocket)
-        except Exception:
-            if self.app.propagate_exceptions:
-                raise
-            else:
-                response = await traceback_response()
+        except Exception as error:
+            response = await _handle_exception(self.app, error)
 
         if response is not None and not self._accepted:
-            if "websocket.http.response" in self.scope.get("extensions", {}):
+            extensions = self.scope.get("extensions", {}) or {}
+            if "websocket.http.response" in extensions:
                 headers = [
                     (key.lower().encode(), value.encode())
                     for key, value in response.headers.items()
@@ -268,10 +277,10 @@ class ASGIWebsocketConnection:
             await send({"type": "websocket.send", "bytes": None, "text": data})
         else:
             await send({"type": "websocket.send", "bytes": data, "text": None})
-        await websocket_sent.send(data)
+        await websocket_sent.send_async(data)
 
     async def accept_connection(
-        self, send: ASGISendCallable, headers: Headers, subprotocol: Optional[str]
+        self, send: ASGISendCallable, headers: Headers, subprotocol: str | None
     ) -> None:
         if not self._accepted:
             message: WebsocketAcceptEvent = {
@@ -300,7 +309,7 @@ class ASGIWebsocketConnection:
 
 
 class ASGILifespan:
-    def __init__(self, app: "Quart", scope: LifespanScope) -> None:
+    def __init__(self, app: Quart, scope: LifespanScope) -> None:
         self.app = app
 
     async def __call__(self, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
@@ -337,21 +346,12 @@ class ASGILifespan:
                 break
 
 
-async def _cancel_tasks(tasks: Set[asyncio.Task]) -> None:
-    # Cancel any pending, and wait for the cancellation to
-    # complete i.e. finish any remaining work.
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    _raise_exceptions(tasks)
-
-
-def _raise_exceptions(tasks: Set[asyncio.Task]) -> None:
-    # Raise any unexpected exceptions
-    for task in tasks:
-        if not task.cancelled() and task.exception() is not None:
-            raise task.exception()
-
-
-def _convert_version(raw: str) -> List[int]:
+def _convert_version(raw: str) -> list[int]:
     return list(map(int, raw.split(".")))
+
+
+async def _handle_exception(app: Quart, error: Exception) -> Response:
+    if not app.testing and app.config["PROPAGATE_EXCEPTIONS"]:
+        return await traceback_response(error)
+    else:
+        raise error

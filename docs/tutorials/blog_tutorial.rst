@@ -9,7 +9,7 @@ HTML directly to the user.
 
 This tutorial is meant to serve as an introduction to building server
 rendered websites in Quart. If you want to skip to the end the code is
-on `Github <https://github.com/pgjones/quart/example/blog>`_.
+on `Github <https://github.com/pallets/quart/tree/main/examples/blog>`_.
 
 1: Creating the project
 -----------------------
@@ -165,7 +165,7 @@ and should be added to *src/blog/templates/posts.html*:
       {% endfor %}
     </main>
 
-Now we need a route to to query the database, retrieve the messages,
+Now we need a route to query the database, retrieve the messages,
 and render the template. As done with the following code which should
 be added to *src/blog/__init__.py*:
 
@@ -303,7 +303,7 @@ If you are running this in the Quart example folder you'll need to add
 a ``-c pyproject.toml`` option to prevent pytest from using the Quart
 pytest configuration.
 
-7: Summary
+8: Summary
 ----------
 
 We've built a simple database backed blog server. This should be a

@@ -14,13 +14,9 @@ from typing import (
     Awaitable,
     Callable,
     Coroutine,
-    Dict,
     Generator,
     Iterable,
-    List,
-    Tuple,
     TYPE_CHECKING,
-    Union,
 )
 
 from werkzeug.datastructures import Headers
@@ -37,7 +33,7 @@ class MustReloadError(Exception):
 
 def file_path_to_path(*paths: FilePath) -> Path:
     # Flask supports bytes paths
-    safe_paths: List[Union[str, os.PathLike]] = []
+    safe_paths: list[str | os.PathLike] = []
     for path in paths:
         if isinstance(path, bytes):
             safe_paths.append(path.decode())
@@ -94,45 +90,16 @@ def run_sync_iterable(iterable: Generator[Any, None, None]) -> AsyncGenerator[An
     return _gen_wrapper()
 
 
-def is_coroutine_function(func: Any) -> bool:
-    # Python < 3.8 does not correctly determine partially wrapped
-    # coroutine functions are coroutine functions, hence the need for
-    # this to exist. Code taken from CPython.
-    if sys.version_info >= (3, 8):
-        return asyncio.iscoroutinefunction(func)
-    else:
-        # Note that there is something special about the AsyncMock
-        # such that it isn't determined as a coroutine function
-        # without an explicit check.
-        try:
-            from mock import AsyncMock
-
-            if isinstance(func, AsyncMock):
-                return True
-        except ImportError:
-            # Not testing, no asynctest to import
-            pass
-
-        while inspect.ismethod(func):
-            func = func.__func__
-        while isinstance(func, partial):
-            func = func.func
-        if not inspect.isfunction(func):
-            return False
-        result = bool(func.__code__.co_flags & inspect.CO_COROUTINE)
-        return result or getattr(func, "_is_coroutine", None) is asyncio.coroutines._is_coroutine
-
-
-def encode_headers(headers: Headers) -> List[Tuple[bytes, bytes]]:
+def encode_headers(headers: Headers) -> list[tuple[bytes, bytes]]:
     return [(key.lower().encode(), value.encode()) for key, value in headers.items()]
 
 
-def decode_headers(headers: Iterable[Tuple[bytes, bytes]]) -> Headers:
+def decode_headers(headers: Iterable[tuple[bytes, bytes]]) -> Headers:
     return Headers([(key.decode(), value.decode()) for key, value in headers])
 
 
 async def observe_changes(sleep: Callable[[float], Awaitable[Any]], shutdown_event: Event) -> None:
-    last_updates: Dict[Path, float] = {}
+    last_updates: dict[Path, float] = {}
     for module in list(sys.modules.values()):
         filename = getattr(module, "__file__", None)
         if filename is None:
@@ -178,14 +145,14 @@ def restart() -> None:
                 executable = str(script_path.with_suffix(".exe"))
             else:
                 # python run.py
-                args.append(str(script_path))
+                args = [str(script_path), *args]
         else:
             if script_path.is_file() and os.access(script_path, os.X_OK):
                 # hypercorn run:app --reload
                 executable = str(script_path)
             else:
                 # python run.py
-                args.append(str(script_path))
+                args = [str(script_path), *args]
     else:
         # Executed as a module e.g. python -m run
         module = script_path.stem
@@ -195,3 +162,19 @@ def restart() -> None:
         args[:0] = ["-m", import_name.lstrip(".")]
 
     os.execv(executable, [executable] + args)
+
+
+async def cancel_tasks(tasks: set[asyncio.Task]) -> None:
+    # Cancel any pending, and wait for the cancellation to
+    # complete i.e. finish any remaining work.
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    raise_task_exceptions(tasks)
+
+
+def raise_task_exceptions(tasks: set[asyncio.Task]) -> None:
+    # Raise any unexpected exceptions
+    for task in tasks:
+        if not task.cancelled() and task.exception() is not None:
+            raise task.exception()

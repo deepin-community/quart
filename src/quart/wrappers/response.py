@@ -13,10 +13,8 @@ from typing import (
     AsyncIterable,
     AsyncIterator,
     Iterable,
-    Optional,
     overload,
     TYPE_CHECKING,
-    Union,
 )
 
 from aiofiles import open as async_open
@@ -73,19 +71,16 @@ class DataBody(ResponseBody):
         self.begin = 0
         self.end = len(self.data)
 
-    async def __aenter__(self) -> "DataBody":
+    async def __aenter__(self) -> DataBody:
         return self
 
     async def __aexit__(self, exc_type: type, exc_value: BaseException, tb: TracebackType) -> None:
         pass
 
-    def __aiter__(self) -> AsyncIterator:
-        async def _aiter() -> AsyncGenerator[bytes, None]:
-            yield self.data[self.begin : self.end]
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return _DataBodyGen(self)
 
-        return _aiter()
-
-    async def make_conditional(self, begin: int, end: Optional[int]) -> int:
+    async def make_conditional(self, begin: int, end: int | None) -> int:
         self.begin = begin
         self.end = len(self.data) if end is None else end
         self.end = min(len(self.data), self.end)
@@ -93,8 +88,21 @@ class DataBody(ResponseBody):
         return len(self.data)
 
 
+class _DataBodyGen(AsyncIterator[bytes]):
+    def __init__(self, data_body: DataBody):
+        self._data_body = data_body
+        self._iterated = False
+
+    async def __anext__(self) -> bytes:
+        if self._iterated:
+            raise StopAsyncIteration
+
+        self._iterated = True
+        return self._data_body.data[self._data_body.begin : self._data_body.end]
+
+
 class IterableBody(ResponseBody):
-    def __init__(self, iterable: Union[AsyncGenerator[bytes, None], Iterable]) -> None:
+    def __init__(self, iterable: AsyncGenerator[bytes, None] | Iterable) -> None:
         self.iter: AsyncGenerator[bytes, None]
         if isasyncgen(iterable):
             self.iter = iterable
@@ -108,7 +116,7 @@ class IterableBody(ResponseBody):
 
             self.iter = _aiter()
 
-    async def __aenter__(self) -> "IterableBody":
+    async def __aenter__(self) -> IterableBody:
         return self
 
     async def __aexit__(self, exc_type: type, exc_value: BaseException, tb: TracebackType) -> None:
@@ -132,19 +140,17 @@ class FileBody(ResponseBody):
 
     buffer_size = 8192
 
-    def __init__(
-        self, file_path: Union[str, PathLike], *, buffer_size: Optional[int] = None
-    ) -> None:
+    def __init__(self, file_path: str | PathLike, *, buffer_size: int | None = None) -> None:
         self.file_path = file_path_to_path(file_path)
         self.size = self.file_path.stat().st_size
         self.begin = 0
         self.end = self.size
         if buffer_size is not None:
             self.buffer_size = buffer_size
-        self.file: Optional[AsyncBufferedIOBase] = None
+        self.file: AsyncBufferedIOBase | None = None
         self.file_manager: AiofilesContextManager[None, None, AsyncBufferedReader] = None
 
-    async def __aenter__(self) -> "FileBody":
+    async def __aenter__(self) -> FileBody:
         self.file_manager = async_open(self.file_path, mode="rb")
         self.file = await self.file_manager.__aenter__()
         await self.file.seek(self.begin)
@@ -153,7 +159,7 @@ class FileBody(ResponseBody):
     async def __aexit__(self, exc_type: type, exc_value: BaseException, tb: TracebackType) -> None:
         await self.file_manager.__aexit__(exc_type, exc_value, tb)
 
-    def __aiter__(self) -> "FileBody":
+    def __aiter__(self) -> FileBody:
         return self
 
     async def __anext__(self) -> bytes:
@@ -168,7 +174,7 @@ class FileBody(ResponseBody):
         else:
             raise StopAsyncIteration()
 
-    async def make_conditional(self, begin: int, end: Optional[int]) -> int:
+    async def make_conditional(self, begin: int, end: int | None) -> int:
         self.begin = begin
         self.end = self.size if end is None else end
         self.end = min(self.size, self.end)
@@ -190,7 +196,7 @@ class IOBody(ResponseBody):
 
     buffer_size = 8192
 
-    def __init__(self, io_stream: BytesIO, *, buffer_size: Optional[int] = None) -> None:
+    def __init__(self, io_stream: BytesIO, *, buffer_size: int | None = None) -> None:
         self.io_stream = io_stream
         self.size = io_stream.getbuffer().nbytes
         self.begin = 0
@@ -198,14 +204,14 @@ class IOBody(ResponseBody):
         if buffer_size is not None:
             self.buffer_size = buffer_size
 
-    async def __aenter__(self) -> "IOBody":
+    async def __aenter__(self) -> IOBody:
         self.io_stream.seek(self.begin)
         return self
 
     async def __aexit__(self, exc_type: type, exc_value: BaseException, tb: TracebackType) -> None:
         return None
 
-    def __aiter__(self) -> "IOBody":
+    def __aiter__(self) -> IOBody:
         return self
 
     async def __anext__(self) -> bytes:
@@ -220,7 +226,7 @@ class IOBody(ResponseBody):
         else:
             raise StopAsyncIteration()
 
-    async def make_conditional(self, begin: int, end: Optional[int]) -> int:
+    async def make_conditional(self, begin: int, end: int | None) -> int:
         self.begin = begin
         self.end = self.size if end is None else end
         self.end = min(self.size, self.end)
@@ -256,11 +262,11 @@ class Response(SansIOResponse):
 
     def __init__(
         self,
-        response: Union[ResponseBody, AnyStr, Iterable, None] = None,
-        status: Optional[int] = None,
-        headers: Optional[Union[dict, Headers]] = None,
-        mimetype: Optional[str] = None,
-        content_type: Optional[str] = None,
+        response: ResponseBody | AnyStr | Iterable | None = None,
+        status: int | None = None,
+        headers: dict | Headers | None = None,
+        mimetype: str | None = None,
+        content_type: str | None = None,
     ) -> None:
         """Create a response object.
 
@@ -302,16 +308,13 @@ class Response(SansIOResponse):
         return super().max_cookie_size
 
     @overload
-    async def get_data(self, as_text: Literal[True]) -> str:
-        ...
+    async def get_data(self, as_text: Literal[True]) -> str: ...
 
     @overload
-    async def get_data(self, as_text: Literal[False]) -> bytes:
-        ...
+    async def get_data(self, as_text: Literal[False]) -> bytes: ...
 
     @overload
-    async def get_data(self, as_text: bool = True) -> AnyStr:
-        ...
+    async def get_data(self, as_text: bool = True) -> AnyStr: ...
 
     async def get_data(self, as_text: bool = False) -> AnyStr:
         """Return the body data."""
@@ -321,7 +324,7 @@ class Response(SansIOResponse):
         async with self.response as body:
             async for data in body:
                 if as_text:
-                    result += data.decode(self.charset)
+                    result += data.decode()
                 else:
                     result += data
         return result  # type: ignore
@@ -332,7 +335,7 @@ class Response(SansIOResponse):
         This will encode using the :attr:`charset`.
         """
         if isinstance(data, str):
-            bytes_data = data.encode(self.charset)
+            bytes_data = data.encode()
         else:
             bytes_data = data
         self.response = self.data_body_class(bytes_data)
@@ -371,7 +374,7 @@ class Response(SansIOResponse):
                 raise
             return None
 
-    def _is_range_request_processable(self, request: "Request") -> bool:
+    def _is_range_request_processable(self, request: Request) -> bool:
         return (
             "If-Range" not in request.headers
             or not is_resource_modified(
@@ -389,9 +392,9 @@ class Response(SansIOResponse):
 
     async def _process_range_request(
         self,
-        request: "Request",
-        complete_length: Optional[int] = None,
-        accept_ranges: Optional[str] = None,
+        request: Request,
+        complete_length: int | None = None,
+        accept_ranges: str | None = None,
     ) -> bool:
         if (
             accept_ranges is None
@@ -421,7 +424,7 @@ class Response(SansIOResponse):
         self.content_range = ContentRange(
             request_range.units,
             self.response.begin,  # type: ignore
-            self.response.end - 1,  # type: ignore
+            self.response.end,  # type: ignore
             complete_length,
         )
         self.status_code = 206
@@ -430,10 +433,10 @@ class Response(SansIOResponse):
 
     async def make_conditional(
         self,
-        request: "Request",
-        accept_ranges: Union[bool, str] = False,
-        complete_length: Optional[int] = None,
-    ) -> "Response":
+        request: Request,
+        accept_ranges: bool | str = False,
+        complete_length: int | None = None,
+    ) -> Response:
         if request.method in {"GET", "HEAD"}:
             accept_ranges = _clean_accept_ranges(accept_ranges)
             is206 = await self._process_range_request(request, complete_length, accept_ranges)
@@ -452,6 +455,8 @@ class Response(SansIOResponse):
                     self.status_code = 412
                 else:
                     self.status_code = 304
+                    self.set_data(b"")
+                    del self.content_length
 
         return self
 
@@ -463,17 +468,17 @@ class Response(SansIOResponse):
         async with self.response as response_body:
             async for item in response_body:
                 if isinstance(item, str):
-                    yield item.encode(self.charset)
+                    yield item.encode()
                 else:
                     yield item
 
     async def freeze(self) -> None:
         """Freeze this object ready for pickling."""
-        self.set_data((await self.get_data()))
+        self.set_data(await self.get_data())
 
     async def add_etag(self, overwrite: bool = False, weak: bool = False) -> None:
         if overwrite or "etag" not in self.headers:
-            self.set_etag(md5((await self.get_data(as_text=False))).hexdigest(), weak)
+            self.set_etag(md5(await self.get_data(as_text=False)).hexdigest(), weak)
 
     def _set_or_pop_header(self, key: str, value: str) -> None:
         if value == "":
@@ -482,7 +487,7 @@ class Response(SansIOResponse):
             self.headers[key] = value
 
 
-def _clean_accept_ranges(accept_ranges: Union[bool, str]) -> str:
+def _clean_accept_ranges(accept_ranges: bool | str) -> str:
     if accept_ranges is True:
         return "bytes"
     elif accept_ranges is False:

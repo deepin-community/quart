@@ -5,7 +5,6 @@ python-quart-doc: repeated-path-segment chat [usr/share/doc/python3-quart/exampl
 python-quart-doc: repeated-path-segment video [usr/share/doc/python3-quart/examples/video/src/video/]
 
 # Intended by sphinx design, we ship the source of the HTML data.
-python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.flask_patch.html]
 python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.wrappers.base.html]
 python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.wrappers.html]
 python-quart-doc: file-references-package-build-path [usr/share/doc/python-quart-doc/html/reference/source/quart.wrappers.response.html]
