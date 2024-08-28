@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Callable, Optional
+from typing import Callable
 
 import pytest
 from werkzeug.datastructures import Headers
@@ -47,8 +47,8 @@ async def test_methods() -> None:
 )
 def test_build_headers_path_and_query_string(
     path: str,
-    query_string: Optional[dict],
-    subdomain: Optional[str],
+    query_string: dict | None,
+    subdomain: str | None,
     expected_path: str,
     expected_query_string: bytes,
     expected_host: str,
@@ -210,6 +210,22 @@ async def test_form() -> None:
     client = Client(app)
     response = await client.post("/", form={"a": "b"})
     assert (await response.get_json()) == {"a": "b"}
+
+
+async def test_files() -> None:
+    app = Quart(__name__)
+
+    @app.route("/", methods=["POST"])
+    async def echo() -> Response:
+        files = await request.files
+        data = files["file"].read()
+        return data
+
+    client = Client(app)
+    response = await client.post(
+        "/", files={"file": FileStorage(BytesIO(b"bar"), filename="a.txt")}
+    )
+    assert (await response.get_data(as_text=True)) == "bar"
 
 
 async def test_data() -> None:

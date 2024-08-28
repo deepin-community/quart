@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import cast, List, Optional
+from typing import cast
 
 import click
 import pytest
@@ -73,6 +73,22 @@ async def test_blueprint_url_prefix() -> None:
         assert request.blueprint == "blueprint"
 
 
+async def test_empty_path_with_url_prefix() -> None:
+    app = Quart(__name__)
+    prefix = Blueprint("prefix", __name__, url_prefix="/prefix")
+
+    @prefix.route("")
+    async def empty_path_route() -> ResponseReturnValue:
+        return "OK"
+
+    app.register_blueprint(prefix)
+
+    test_client = app.test_client()
+    response = await test_client.get("/prefix")
+    assert response.status_code == 200
+    assert await response.get_data() == b"OK"  # type: ignore
+
+
 async def test_blueprint_template_filter() -> None:
     app = Quart(__name__)
     blueprint = Blueprint("blueprint", __name__)
@@ -141,7 +157,7 @@ async def test_blueprint_method_view() -> None:
         (Ellipsis, ["blueprint", "cmd"]),
     ],
 )
-def test_cli_blueprints(cli_group: Optional[str], args: List[str]) -> None:
+def test_cli_blueprints(cli_group: str | None, args: list[str]) -> None:
     app = Quart(__name__)
 
     blueprint = Blueprint("blueprint", __name__, cli_group=cli_group)
@@ -168,10 +184,10 @@ def test_cli_blueprints(cli_group: Optional[str], args: List[str]) -> None:
     ],
 )
 async def test_nesting_url_prefixes(
-    parent_init: Optional[str],
-    child_init: Optional[str],
-    parent_registration: Optional[str],
-    child_registration: Optional[str],
+    parent_init: str | None,
+    child_init: str | None,
+    parent_registration: str | None,
+    child_registration: str | None,
 ) -> None:
     app = Quart(__name__)
 
@@ -187,6 +203,39 @@ async def test_nesting_url_prefixes(
 
     test_client = app.test_client()
     response = await test_client.get("/parent/child/")
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "parent_subdomain, child_subdomain, expected_subdomain",
+    [
+        (None, None, None),
+        ("parent", None, "parent"),
+        (None, "child", "child"),
+        ("parent", "child", "child.parent"),
+    ],
+)
+async def test_nesting_subdomains(
+    parent_subdomain: str | None,
+    child_subdomain: str | None,
+    expected_subdomain: str | None,
+) -> None:
+    app = Quart(__name__)
+    domain_name = "domain.tld"
+    app.config["SERVER_NAME"] = domain_name
+
+    parent = Blueprint("parent", __name__, subdomain=parent_subdomain)
+    child = Blueprint("child", __name__, subdomain=child_subdomain)
+
+    @child.route("/")
+    def index() -> ResponseReturnValue:
+        return "index"
+
+    parent.register_blueprint(child)
+    app.register_blueprint(parent)
+
+    test_client = app.test_client()
+    response = await test_client.get("/", subdomain=expected_subdomain)
     assert response.status_code == 200
 
 
@@ -217,9 +266,13 @@ def test_unique_blueprint_names() -> None:
     bp2 = Blueprint("bp", __name__)
 
     app.register_blueprint(bp)
-    app.register_blueprint(bp)  # Should not error
+
+    with pytest.raises(ValueError):
+        app.register_blueprint(bp)
+
     with pytest.raises(ValueError):
         app.register_blueprint(bp2, url_prefix="/a")
+
     app.register_blueprint(bp, name="alt")
 
 
@@ -339,7 +392,7 @@ async def test_nested_callback_order() -> None:
         g.setdefault("seen", []).append("app_1")
 
     @app.teardown_request
-    async def app_teardown1(exc: Optional[BaseException] = None) -> None:
+    async def app_teardown1(exc: BaseException | None = None) -> None:
         assert g.seen.pop() == "app_1"
 
     @app.before_request
@@ -347,7 +400,7 @@ async def test_nested_callback_order() -> None:
         g.setdefault("seen", []).append("app_2")
 
     @app.teardown_request
-    async def app_teardown2(exc: Optional[BaseException] = None) -> None:
+    async def app_teardown2(exc: BaseException | None = None) -> None:
         assert g.seen.pop() == "app_2"
 
     @app.context_processor
@@ -359,7 +412,7 @@ async def test_nested_callback_order() -> None:
         g.setdefault("seen", []).append("parent_1")
 
     @parent.teardown_request
-    async def parent_teardown1(exc: Optional[BaseException] = None) -> None:
+    async def parent_teardown1(exc: BaseException | None = None) -> None:
         assert g.seen.pop() == "parent_1"
 
     @parent.before_request
@@ -367,7 +420,7 @@ async def test_nested_callback_order() -> None:
         g.setdefault("seen", []).append("parent_2")
 
     @parent.teardown_request
-    async def parent_teardown2(exc: Optional[BaseException] = None) -> None:
+    async def parent_teardown2(exc: BaseException | None = None) -> None:
         assert g.seen.pop() == "parent_2"
 
     @parent.context_processor
@@ -379,7 +432,7 @@ async def test_nested_callback_order() -> None:
         g.setdefault("seen", []).append("child_1")
 
     @child.teardown_request
-    async def child_teardown1(exc: Optional[BaseException] = None) -> None:
+    async def child_teardown1(exc: BaseException | None = None) -> None:
         assert g.seen.pop() == "child_1"
 
     @child.before_request
@@ -387,7 +440,7 @@ async def test_nested_callback_order() -> None:
         g.setdefault("seen", []).append("child_2")
 
     @child.teardown_request
-    async def child_teardown2(exc: Optional[BaseException] = None) -> None:
+    async def child_teardown2(exc: BaseException | None = None) -> None:
         assert g.seen.pop() == "child_2"
 
     @child.context_processor

@@ -1,21 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import (
-    Any,
-    AnyStr,
-    Awaitable,
-    Callable,
-    Dict,
-    Generator,
-    List,
-    NoReturn,
-    Optional,
-    overload,
-)
+from typing import Any, AnyStr, Awaitable, Callable, Generator, NoReturn, overload
 
 from hypercorn.typing import HTTPScope
-from werkzeug.datastructures import CombinedMultiDict, Headers, MultiDict
+from werkzeug.datastructures import CombinedMultiDict, Headers, iter_multi_items, MultiDict
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge, RequestTimeout
 
 from .base import BaseRequestWebsocket
@@ -53,9 +42,7 @@ class Body:
     it.
     """
 
-    def __init__(
-        self, expected_content_length: Optional[int], max_content_length: Optional[int]
-    ) -> None:
+    def __init__(self, expected_content_length: int | None, max_content_length: int | None) -> None:
         self._data = bytearray()
         self._complete: asyncio.Event = asyncio.Event()
         self._has_data: asyncio.Event = asyncio.Event()
@@ -63,7 +50,7 @@ class Body:
         # Exceptions must be raised within application (not ASGI)
         # calls, this is achieved by having the ASGI methods set this
         # to an exception on error.
-        self._must_raise: Optional[Exception] = None
+        self._must_raise: Exception | None = None
         if (
             expected_content_length is not None
             and max_content_length is not None
@@ -71,7 +58,7 @@ class Body:
         ):
             self._must_raise = RequestEntityTooLarge()
 
-    def __aiter__(self) -> "Body":
+    def __aiter__(self) -> Body:
         return self
 
     async def __anext__(self) -> bytes:
@@ -155,8 +142,8 @@ class Request(BaseRequestWebsocket):
         http_version: str,
         scope: HTTPScope,
         *,
-        max_content_length: Optional[int] = None,
-        body_timeout: Optional[int] = None,
+        max_content_length: int | None = None,
+        body_timeout: int | None = None,
         send_push_promise: Callable[[str, Headers], Awaitable[None]],
     ) -> None:
         """Create a request object.
@@ -185,9 +172,9 @@ class Request(BaseRequestWebsocket):
         )
         self.body_timeout = body_timeout
         self.body = self.body_class(self.content_length, max_content_length)
-        self._cached_json: Dict[bool, Any] = {False: Ellipsis, True: Ellipsis}
-        self._form: Optional[MultiDict] = None
-        self._files: Optional[MultiDict] = None
+        self._cached_json: dict[bool, Any] = {False: Ellipsis, True: Ellipsis}
+        self._form: MultiDict | None = None
+        self._files: MultiDict | None = None
         self._parsing_lock = self.lock_class()
         self._send_push_promise = send_push_promise
 
@@ -200,18 +187,17 @@ class Request(BaseRequestWebsocket):
         return await self.get_data(as_text=False, parse_form_data=True)
 
     @overload
-    async def get_data(self, cache: bool, as_text: Literal[False], parse_form_data: bool) -> bytes:
-        ...
+    async def get_data(
+        self, cache: bool, as_text: Literal[False], parse_form_data: bool
+    ) -> bytes: ...
 
     @overload
-    async def get_data(self, cache: bool, as_text: Literal[True], parse_form_data: bool) -> str:
-        ...
+    async def get_data(self, cache: bool, as_text: Literal[True], parse_form_data: bool) -> str: ...
 
     @overload
     async def get_data(
         self, cache: bool = True, as_text: bool = False, parse_form_data: bool = False
-    ) -> AnyStr:
-        ...
+    ) -> AnyStr: ...
 
     async def get_data(
         self, cache: bool = True, as_text: bool = False, parse_form_data: bool = False
@@ -239,7 +225,7 @@ class Request(BaseRequestWebsocket):
                 self.body.clear()
 
             if as_text:
-                return raw_data.decode(self.charset, self.encoding_errors)
+                return raw_data.decode()
             else:
                 return raw_data
 
@@ -253,7 +239,7 @@ class Request(BaseRequestWebsocket):
             form = await self.form
             sources.append(form)
 
-        multidict_sources: List[MultiDict] = []
+        multidict_sources: list[MultiDict] = []
         for source in sources:
             if not isinstance(source, MultiDict):
                 multidict_sources.append(MultiDict(source))
@@ -284,8 +270,6 @@ class Request(BaseRequestWebsocket):
 
     def make_form_data_parser(self) -> FormDataParser:
         return self.form_data_parser_class(
-            charset=self.charset,
-            errors=self.encoding_errors,
             max_content_length=self.max_content_length,
             cls=self.parameter_storage_class,
         )
@@ -362,3 +346,7 @@ class Request(BaseRequestWebsocket):
             for value in self.headers.getlist(name):
                 headers.add(name, value)
         await self._send_push_promise(path, headers)
+
+    async def close(self) -> None:
+        for _key, value in iter_multi_items(self._files or ()):
+            value.close()

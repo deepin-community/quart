@@ -4,20 +4,21 @@ import mimetypes
 import os
 import pkgutil
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, NoReturn, Optional, Tuple, Union
+from typing import Any, Callable, cast, Iterable, NoReturn
 from zlib import adler32
 
+from flask.helpers import get_root_path as get_root_path  # noqa: F401
 from werkzeug.exceptions import abort as werkzeug_abort, NotFound
 from werkzeug.utils import redirect as werkzeug_redirect, safe_join
 from werkzeug.wrappers import Response as WerkzeugResponse
 
 from .globals import _cv_request, current_app, request, request_ctx, session
 from .signals import message_flashed
-from .typing import FilePath
+from .typing import FilePath, ResponseReturnValue, ResponseTypes
 from .utils import file_path_to_path
 from .wrappers import Response
 from .wrappers.response import ResponseBody
@@ -33,11 +34,7 @@ def get_debug_flag() -> bool:
     configured, it will be enabled automatically.
     """
     value = os.getenv("QUART_DEBUG", None)
-
-    if value is None:
-        return "development" == get_env()
-
-    return value.lower() not in {"0", "false", "no"}
+    return bool(value and value.lower() not in {"0", "false", "no"})
 
 
 def get_load_dotenv(default: bool = True) -> bool:
@@ -54,14 +51,7 @@ def get_load_dotenv(default: bool = True) -> bool:
     return val.lower() in ("0", "false", "no")
 
 
-def get_env(default: Optional[str] = "production") -> str:
-    """Reads QUART_ENV environment variable to determine in which environment
-    the app is running on. Defaults to 'production' when unset.
-    """
-    return os.getenv("QUART_ENV", default)
-
-
-async def make_response(*args: Any) -> Union[Response, WerkzeugResponse]:
+async def make_response(*args: Any) -> ResponseTypes:
     """Create a response, a simple wrapper function.
 
     This is most useful when you want to alter a Response before
@@ -78,7 +68,7 @@ async def make_response(*args: Any) -> Union[Response, WerkzeugResponse]:
     if len(args) == 1:
         args = args[0]
 
-    return await current_app.make_response(args)
+    return await current_app.make_response(cast(ResponseReturnValue, args))
 
 
 async def make_push_promise(path: str) -> None:
@@ -113,14 +103,15 @@ async def flash(message: str, category: str = "message") -> None:
     flashes = session.get("_flashes", [])
     flashes.append((category, message))
     session["_flashes"] = flashes
-    await message_flashed.send(
-        current_app._get_current_object(), message=message, category=category  # type: ignore
+    app = current_app._get_current_object()  # type: ignore
+    await message_flashed.send_async(
+        app, _sync_wrapper=app.ensure_async, message=message, category=category
     )
 
 
 def get_flashed_messages(
     with_categories: bool = False, category_filter: Iterable[str] = ()
-) -> Union[List[str], List[Tuple[str, str]]]:
+) -> list[str] | list[tuple[str, str]]:
     """Retrieve the flashed messages stored in the session.
 
     This is mostly useful in templates where it is exposed as a global
@@ -149,20 +140,6 @@ def get_flashed_messages(
     return flashes
 
 
-def get_root_path(import_name: str) -> str:
-    """Find the root path of the *import_name*"""
-    module = sys.modules.get(import_name)
-    if module is not None and hasattr(module, "__file__"):
-        file_path = module.__file__
-    else:
-        loader = pkgutil.get_loader(import_name)
-        if loader is None or import_name == "__main__":
-            return str(Path.cwd())
-        else:
-            file_path = loader.get_filename(import_name)  # type: ignore
-    return str(Path(file_path).resolve().parent)
-
-
 def get_template_attribute(template_name: str, attribute: str) -> Any:
     """Load a attribute from a template.
 
@@ -179,10 +156,10 @@ def get_template_attribute(template_name: str, attribute: str) -> Any:
 def url_for(
     endpoint: str,
     *,
-    _anchor: Optional[str] = None,
-    _external: Optional[bool] = None,
-    _method: Optional[str] = None,
-    _scheme: Optional[str] = None,
+    _anchor: str | None = None,
+    _external: bool | None = None,
+    _method: str | None = None,
+    _scheme: str | None = None,
     **values: Any,
 ) -> str:
     """Return the url for a specific endpoint.
@@ -240,7 +217,7 @@ def stream_with_context(func: Callable) -> Callable:
     return generator
 
 
-def find_package(name: str) -> Tuple[Optional[Path], Path]:
+def find_package(name: str) -> tuple[Path | None, Path]:
     """Finds packages install prefix (or None) and it's containing Folder"""
     module = name.split(".")[0]
     loader = pkgutil.get_loader(module)
@@ -248,13 +225,13 @@ def find_package(name: str) -> Tuple[Optional[Path], Path]:
         package_path = Path.cwd()
     else:
         if hasattr(loader, "get_filename"):
-            filename = loader.get_filename(module)  # type: ignore
+            filename = loader.get_filename(module)
         else:
             __import__(name)
             filename = sys.modules[name].__file__
         package_path = Path(filename).resolve().parent
         if hasattr(loader, "is_package"):
-            is_package = loader.is_package(module)  # type: ignore
+            is_package = loader.is_package(module)
             if is_package:
                 package_path = Path(package_path).resolve().parent
     sys_prefix = Path(sys.prefix).resolve()
@@ -270,13 +247,13 @@ async def send_from_directory(
     directory: FilePath,
     file_name: str,
     *,
-    mimetype: Optional[str] = None,
+    mimetype: str | None = None,
     as_attachment: bool = False,
-    attachment_filename: Optional[str] = None,
+    attachment_filename: str | None = None,
     add_etags: bool = True,
-    cache_timeout: Optional[int] = None,
+    cache_timeout: int | None = None,
     conditional: bool = True,
-    last_modified: Optional[datetime] = None,
+    last_modified: datetime | None = None,
 ) -> Response:
     """Send a file from a given directory.
 
@@ -307,14 +284,14 @@ async def send_from_directory(
 
 
 async def send_file(
-    filename_or_io: Union[FilePath, BytesIO],
-    mimetype: Optional[str] = None,
+    filename_or_io: FilePath | BytesIO,
+    mimetype: str | None = None,
     as_attachment: bool = False,
-    attachment_filename: Optional[str] = None,
+    attachment_filename: str | None = None,
     add_etags: bool = True,
-    cache_timeout: Optional[int] = None,
+    cache_timeout: int | None = None,
     conditional: bool = False,
-    last_modified: Optional[datetime] = None,
+    last_modified: datetime | None = None,
 ) -> Response:
     """Return a Response to send the filename given.
 
@@ -333,8 +310,8 @@ async def send_file(
 
     """
     file_body: ResponseBody
-    file_size: Optional[int] = None
-    etag: Optional[str] = None
+    file_size: int | None = None
+    etag: str | None = None
     if isinstance(filename_or_io, BytesIO):
         file_body = current_app.response_class.io_body_class(filename_or_io)
         file_size = filename_or_io.getbuffer().nbytes
@@ -371,7 +348,7 @@ async def send_file(
     response.cache_control.public = True
     if cache_timeout is not None:
         response.cache_control.max_age = cache_timeout
-        response.expires = datetime.utcnow() + timedelta(seconds=cache_timeout)
+        response.expires = datetime.now(timezone.utc) + timedelta(seconds=cache_timeout)
 
     if add_etags and etag is not None:
         response.set_etag(etag)
@@ -382,14 +359,14 @@ async def send_file(
 
 
 @lru_cache(maxsize=None)
-def _split_blueprint_path(name: str) -> List[str]:
+def _split_blueprint_path(name: str) -> list[str]:
     bps = [name]
     while "." in bps[-1]:
         bps.append(bps[-1].rpartition(".")[0])
     return bps
 
 
-def abort(code: int, *args: Any, **kwargs: Any) -> NoReturn:  # type: ignore[misc]
+def abort(code: int | Response, *args: Any, **kwargs: Any) -> NoReturn:
     """Raise an HTTPException for the given status code."""
     if current_app:
         current_app.aborter(code, *args, **kwargs)

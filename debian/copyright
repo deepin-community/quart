@@ -3,11 +3,12 @@ Source: https://github.com/pallets/quart
 Upstream-Name: Quart
 
 Files: *
-Copyright: 2017-2022 Philip G Jones <philip.graham.jones@googlemail.com>
+Copyright: 2017-2024 Philip G Jones <philip.graham.jones@googlemail.com>
 License: Expat
 
 Files: artwork/*
 Copyright: 2017 Vic Shóstak
+ 2024 Philip G Jones <philip.graham.jones@googlemail.com>
 License: CC0
 
 Files: debian/*

@@ -1,8 +1,57 @@
-quart (0.18.3-2deepin1) unstable; urgency=medium
+quart (0.19.6-1) unstable; urgency=medium
 
-  * fix  No module named 'py._path'; 'py' is not a package.
+  * Team upload
+  * New upstream version 0.19.6
+  * d/control: Increase Standards-Version to 4.7.0
+    No further modifications needed.
+  * d/copyright: Update upstream data
 
- -- LiChengGang <lichenggang@uniontech.com>  Wed, 22 Nov 2023 09:37:34 +0800
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Sun, 26 May 2024 07:24:39 +0200
+
+quart (0.19.5-1) unstable; urgency=medium
+
+  * Team upload
+  * New upstream version 0.19.5
+  * Rebuild patch queue from patch-queu branch
+    Dropped patch (fixed upstream):
+    Fix-issues-with-the-latest-black-mypy-and-pytest.patch
+
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Tue, 02 Apr 2024 22:05:20 +0200
+
+quart (0.19.4-2) unstable; urgency=medium
+
+  * Team upload
+  * Rebuild patch queue from patch-queu branch
+    Added patche:
+    Fix-issues-with-the-latest-black-mypy-and-pytest.patch
+    (Closes: #1066777)
+
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Sun, 17 Mar 2024 12:40:00 +0100
+
+quart (0.19.4-1) unstable; urgency=medium
+
+  * Team upload
+
+  [ Andreas Tille ]
+  * New upstream version 0.19.4
+    (Closes: #1042259)
+  * Standards-Version: 4.6.2 (routine-update)
+  * Add salsa-ci file (routine-update)
+  * Build-Depends: python3-flask
+
+  [ Carsten Schoenert ]
+  * d/gbp.conf: Don't use numbers in patch names
+  * Add patch queue from patch-queue branch
+    Added patch:
+    docs-conf.py-Use-sphinx_rtd_theme-instead.patch
+  * d/control: Keep B-D entries alphabetical
+  * d/rules: Add override for dh_clean
+  * d/rules: Drop direct modification of docs/conf.py
+    Done now through patch queue.
+  * d/rules: Undo modification of pyproject.toml after build
+  * d/python-quart-doc.lintian-overrides: Update data content
+
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Mon, 12 Feb 2024 20:48:14 +0100
 
 quart (0.18.3-2) unstable; urgency=medium
 

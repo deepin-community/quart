@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-import platform
 import signal
 import sys
 import warnings
-from collections import OrderedDict
+from collections import defaultdict
 from datetime import timedelta
 from inspect import isasyncgen, isgenerator
-from logging import Logger
-from pathlib import Path
 from types import TracebackType
 from typing import (
     Any,
@@ -20,40 +17,34 @@ from typing import (
     Callable,
     cast,
     Coroutine,
-    Dict,
-    Iterable,
-    List,
     NoReturn,
     Optional,
+    overload,
     Set,
-    Tuple,
-    Type,
     TypeVar,
     Union,
-    ValuesView,
 )
-from weakref import WeakSet
+from urllib.parse import quote
 
 from aiofiles import open as async_open
 from aiofiles.base import AiofilesContextManager
 from aiofiles.threadpool.binary import AsyncBufferedReader
+from flask.sansio.app import App
+from flask.sansio.scaffold import setupmethod
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HyperConfig
 from hypercorn.typing import ASGIReceiveCallable, ASGISendCallable, Scope
-from werkzeug.datastructures import Authorization, Headers
-from werkzeug.exceptions import Aborter, HTTPException, InternalServerError
+from werkzeug.datastructures import Authorization, Headers, ImmutableDict
+from werkzeug.exceptions import Aborter, BadRequestKeyError, HTTPException, InternalServerError
 from werkzeug.routing import BuildError, MapAdapter, RoutingException
-from werkzeug.urls import url_quote
-from werkzeug.utils import redirect as werkzeug_redirect
 from werkzeug.wrappers import Response as WerkzeugResponse
 
 from .asgi import ASGIHTTPConnection, ASGILifespan, ASGIWebsocketConnection
-from .blueprints import Blueprint
-from .config import Config, ConfigAttribute, DEFAULT_CONFIG
+from .cli import AppGroup
+from .config import Config
 from .ctx import (
     _AppCtxGlobals,
     AppContext,
-    copy_current_app_context,
     has_request_context,
     has_websocket_context,
     RequestContext,
@@ -70,17 +61,8 @@ from .globals import (
     websocket,
     websocket_ctx,
 )
-from .helpers import (
-    _split_blueprint_path,
-    find_package,
-    get_debug_flag,
-    get_env,
-    get_flashed_messages,
-)
-from .json.provider import DefaultJSONProvider, JSONProvider
-from .logging import create_logger
+from .helpers import get_debug_flag, get_flashed_messages, send_from_directory
 from .routing import QuartMap, QuartRule
-from .scaffold import _endpoint_from_view_func, Scaffold, setupmethod
 from .sessions import SecureCookieSessionInterface
 from .signals import (
     appcontext_tearing_down,
@@ -95,7 +77,7 @@ from .signals import (
     websocket_started,
     websocket_tearing_down,
 )
-from .templating import _default_template_ctx_processor, DispatchingJinjaLoader, Environment
+from .templating import _default_template_ctx_processor, Environment
 from .testing import (
     make_test_body_with_headers,
     make_test_headers_path_and_query_string,
@@ -108,15 +90,17 @@ from .testing import (
 )
 from .typing import (
     AfterServingCallable,
+    AfterWebsocketCallable,
     ASGIHTTPProtocol,
     ASGILifespanProtocol,
     ASGIWebsocketProtocol,
-    BeforeFirstRequestCallable,
     BeforeServingCallable,
-    ErrorHandlerCallable,
+    BeforeWebsocketCallable,
+    Event,
     FilePath,
     HeadersValue,
     ResponseReturnValue,
+    ResponseTypes,
     ShellContextProcessorCallable,
     StatusCode,
     TeardownCallable,
@@ -125,11 +109,12 @@ from .typing import (
     TemplateTestCallable,
     TestAppProtocol,
     TestClientProtocol,
+    WebsocketCallable,
     WhileServingCallable,
 )
 from .utils import (
+    cancel_tasks,
     file_path_to_path,
-    is_coroutine_function,
     MustReloadError,
     observe_changes,
     restart,
@@ -137,10 +122,16 @@ from .utils import (
 )
 from .wrappers import BaseRequestWebsocket, Request, Response, Websocket
 
+try:
+    from typing import ParamSpec
+except ImportError:
+    from typing_extensions import ParamSpec  # type: ignore
+
 AppOrBlueprintKey = Optional[str]  # The App key is None, whereas blueprints are named
 T_after_serving = TypeVar("T_after_serving", bound=AfterServingCallable)
-T_before_first_request = TypeVar("T_before_first_request", bound=BeforeFirstRequestCallable)
+T_after_websocket = TypeVar("T_after_websocket", bound=AfterWebsocketCallable)
 T_before_serving = TypeVar("T_before_serving", bound=BeforeServingCallable)
+T_before_websocket = TypeVar("T_before_websocket", bound=BeforeWebsocketCallable)
 T_shell_context_processor = TypeVar(
     "T_shell_context_processor", bound=ShellContextProcessorCallable
 )
@@ -148,16 +139,21 @@ T_teardown = TypeVar("T_teardown", bound=TeardownCallable)
 T_template_filter = TypeVar("T_template_filter", bound=TemplateFilterCallable)
 T_template_global = TypeVar("T_template_global", bound=TemplateGlobalCallable)
 T_template_test = TypeVar("T_template_test", bound=TemplateTestCallable)
+T_websocket = TypeVar("T_websocket", bound=WebsocketCallable)
 T_while_serving = TypeVar("T_while_serving", bound=WhileServingCallable)
 
-
-def _convert_timedelta(value: Union[float, timedelta]) -> timedelta:
-    if not isinstance(value, timedelta):
-        return timedelta(seconds=value)
-    return value
+T = TypeVar("T")
+P = ParamSpec("P")
 
 
-class Quart(Scaffold):
+def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
+    if value is None or isinstance(value, timedelta):
+        return value
+
+    return timedelta(seconds=value)
+
+
+class Quart(App):
     """The web framework class, handles requests and returns responses.
 
     The primary method from a serving viewpoint is
@@ -180,6 +176,8 @@ class Quart(Scaffold):
             websocket protocol.
         config_class: The class to use for the configuration.
         env: The name of the environment the app is running on.
+        event_class: The class to use to signal an event in an async
+            manner.
         debug: Wrapper around configuration DEBUG value, in many places
             this will result in more output if True. If unset, debug
             mode will be activated if environ is set to 'development'.
@@ -193,21 +191,21 @@ class Quart(Scaffold):
         response_class: The class to user for responses.
         secret_key: Warpper around configuration SECRET_KEY value. The app
             secret for signing sessions.
-        session_cookie_name: Wrapper around configuration
-            SESSION_COOKIE_NAME, use to specify the cookie name for session
-            data.
         session_interface: The class to use as the session interface.
+        shutdown_event: This event is set when the app starts to
+            shutdown allowing waiting tasks to know when to stop.
         url_map_class: The class to map rules to endpoints.
         url_rule_class: The class to use for URL rules.
         websocket_class: The class to use for websockets.
 
     """
 
-    asgi_http_class: Type[ASGIHTTPProtocol]
-    asgi_lifespan_class: Type[ASGILifespanProtocol]
-    asgi_websocket_class: Type[ASGIWebsocketProtocol]
-    test_app_class: Type[TestAppProtocol]
-    test_client_class: Type[TestClientProtocol]
+    asgi_http_class: type[ASGIHTTPProtocol]
+    asgi_lifespan_class: type[ASGILifespanProtocol]
+    asgi_websocket_class: type[ASGIWebsocketProtocol]
+    shutdown_event: Event
+    test_app_class: type[TestAppProtocol]
+    test_client_class: type[TestClientProtocol]  # type: ignore[assignment]
 
     aborter_class = Aborter
     app_ctx_globals_class = _AppCtxGlobals
@@ -215,42 +213,64 @@ class Quart(Scaffold):
     asgi_lifespan_class = ASGILifespan
     asgi_websocket_class = ASGIWebsocketConnection
     config_class = Config
-    env = ConfigAttribute("ENV")
-    jinja_environment = Environment
-    jinja_options: dict = {}
-    json_provider_class: Type[JSONProvider] = DefaultJSONProvider
+    event_class = asyncio.Event
+    jinja_environment = Environment  # type: ignore[assignment]
     lock_class = asyncio.Lock
-    permanent_session_lifetime = ConfigAttribute(
-        "PERMANENT_SESSION_LIFETIME", converter=_convert_timedelta
-    )
     request_class = Request
     response_class = Response
-    secret_key = ConfigAttribute("SECRET_KEY")
-    send_file_max_age_default = ConfigAttribute(
-        "SEND_FILE_MAX_AGE_DEFAULT", converter=_convert_timedelta
-    )
-    session_cookie_name = ConfigAttribute("SESSION_COOKIE_NAME")
     session_interface = SecureCookieSessionInterface()
     test_app_class = TestApp
-    test_client_class = QuartClient
-    test_cli_runner_class = QuartCliRunner
-    testing = ConfigAttribute("TESTING")
+    test_client_class = QuartClient  # type: ignore[assignment]
+    test_cli_runner_class = QuartCliRunner  # type: ignore
     url_map_class = QuartMap
-    url_rule_class = QuartRule
+    url_rule_class = QuartRule  # type: ignore[assignment]
     websocket_class = Websocket
+
+    default_config = ImmutableDict(
+        {
+            "APPLICATION_ROOT": "/",
+            "BACKGROUND_TASK_SHUTDOWN_TIMEOUT": 5,  # Second
+            "BODY_TIMEOUT": 60,  # Second
+            "DEBUG": None,
+            "ENV": None,
+            "EXPLAIN_TEMPLATE_LOADING": False,
+            "MAX_CONTENT_LENGTH": 16 * 1024 * 1024,  # 16 MB Limit
+            "MAX_COOKIE_SIZE": 4093,
+            "PERMANENT_SESSION_LIFETIME": timedelta(days=31),
+            # Replaces PREFERRED_URL_SCHEME to allow for WebSocket scheme
+            "PREFER_SECURE_URLS": False,
+            "PRESERVE_CONTEXT_ON_EXCEPTION": None,
+            "PROPAGATE_EXCEPTIONS": None,
+            "RESPONSE_TIMEOUT": 60,  # Second
+            "SECRET_KEY": None,
+            "SEND_FILE_MAX_AGE_DEFAULT": timedelta(hours=12),
+            "SERVER_NAME": None,
+            "SESSION_COOKIE_DOMAIN": None,
+            "SESSION_COOKIE_HTTPONLY": True,
+            "SESSION_COOKIE_NAME": "session",
+            "SESSION_COOKIE_PATH": None,
+            "SESSION_COOKIE_SAMESITE": None,
+            "SESSION_COOKIE_SECURE": False,
+            "SESSION_REFRESH_EACH_REQUEST": True,
+            "TEMPLATES_AUTO_RELOAD": None,
+            "TESTING": False,
+            "TRAP_BAD_REQUEST_ERRORS": None,
+            "TRAP_HTTP_EXCEPTIONS": False,
+        }
+    )
 
     def __init__(
         self,
         import_name: str,
-        static_url_path: Optional[str] = None,
-        static_folder: Optional[str] = "static",
-        static_host: Optional[str] = None,
+        static_url_path: str | None = None,
+        static_folder: str | None = "static",
+        static_host: str | None = None,
         host_matching: bool = False,
         subdomain_matching: bool = False,
-        template_folder: Optional[str] = "templates",
-        instance_path: Optional[str] = None,
+        template_folder: str | None = "templates",
+        instance_path: str | None = None,
         instance_relative_config: bool = False,
-        root_path: Optional[str] = None,
+        root_path: str | None = None,
     ) -> None:
         """Construct a Quart web application.
 
@@ -273,48 +293,48 @@ class Quart(Scaffold):
                 request has been handled.
             after_websocket_funcs: The functions to execute after a
                 websocket has been handled.
-            before_first_request_func: Functions to execute before the
-                first request only.
             before_request_funcs: The functions to execute before handling
                 a request.
             before_websocket_funcs: The functions to execute before handling
                 a websocket.
         """
-        super().__init__(import_name, static_folder, static_url_path, template_folder, root_path)
+        super().__init__(
+            import_name,
+            static_url_path,
+            static_folder,
+            static_host,
+            host_matching,
+            subdomain_matching,
+            template_folder,
+            instance_path,
+            instance_relative_config,
+            root_path,
+        )
 
-        instance_path = Path(instance_path) if instance_path else self.auto_find_instance_path()
-        if not instance_path.is_absolute():
-            raise ValueError("The instance_path must be an absolute path.")
-        self.instance_path = instance_path
+        self.after_serving_funcs: list[Callable[[], Awaitable[None]]] = []
+        self.after_websocket_funcs: dict[AppOrBlueprintKey, list[AfterWebsocketCallable]] = (
+            defaultdict(list)
+        )
+        self.background_tasks: Set[asyncio.Task] = set()
+        self.before_serving_funcs: list[Callable[[], Awaitable[None]]] = []
+        self.before_websocket_funcs: dict[AppOrBlueprintKey, list[BeforeWebsocketCallable]] = (
+            defaultdict(list)
+        )
+        self.teardown_websocket_funcs: dict[AppOrBlueprintKey, list[TeardownCallable]] = (
+            defaultdict(list)
+        )
+        self.while_serving_gens: list[AsyncGenerator[None, None]] = []
 
-        self.aborter = self.make_aborter()
-        self.config = self.make_config(instance_relative_config)
+        self.template_context_processors[None] = [_default_template_ctx_processor]
 
-        self.after_serving_funcs: List[Callable[[], Awaitable[None]]] = []
-        self.background_tasks: WeakSet[asyncio.Task] = WeakSet()
-        self.before_first_request_funcs: List[BeforeFirstRequestCallable] = []
-        self.before_serving_funcs: List[Callable[[], Awaitable[None]]] = []
-        self.blueprints: Dict[str, Blueprint] = OrderedDict()
-        self.extensions: Dict[str, Any] = {}
-        self.json: JSONProvider = self.json_provider_class(self)
-        self.shell_context_processors: List[Callable[[], Dict[str, Any]]] = []
-        self.teardown_appcontext_funcs: List[TeardownCallable] = []
-        self.url_build_error_handlers: List[Callable[[Exception, str, dict], str]] = []
-        self.url_map = self.url_map_class(host_matching=host_matching)
-        self.subdomain_matching = subdomain_matching
-        self.while_serving_gens: List[AsyncGenerator[None, None]] = []
-
-        self._got_first_request = False
-        self._first_request_lock = self.lock_class()
-        self._jinja_env: Optional[Environment] = None
-        self._logger: Optional[Logger] = None
+        self.cli = AppGroup()
+        self.cli.name = self.name
 
         if self.has_static_folder:
-            if bool(static_host) != host_matching:
-                raise ValueError(
-                    "static_host must be set if there is a static folder and host_matching is "
-                    "enabled"
-                )
+            assert (
+                bool(static_host) == host_matching
+            ), "Invalid static_host/host_matching combination"
+
             self.add_url_rule(
                 f"{self.static_url_path}/<path:filename>",
                 "static",
@@ -322,101 +342,53 @@ class Quart(Scaffold):
                 host=static_host,
             )
 
-        self.template_context_processors[None] = [_default_template_ctx_processor]
+    def get_send_file_max_age(self, filename: str | None) -> int | None:
+        """Used by :func:`send_file` to determine the ``max_age`` cache
+        value for a given file path if it wasn't passed.
 
-    def _check_setup_finished(self, f_name: str) -> None:
-        if self._got_first_request:
-            raise AssertionError(
-                f"The setup method '{f_name}' can no longer be called"
-                " on the application. It has already handled its first"
-                " request, any changes will not be applied"
-                " consistently.\n"
-                "Make sure all imports, decorators, functions, etc."
-                " needed to set up the application are done before"
-                " running it."
-            )
+        By default, this returns :data:`SEND_FILE_MAX_AGE_DEFAULT` from
+        the configuration of :data:`~flask.current_app`. This defaults
+        to ``None``, which tells the browser to use conditional requests
+        instead of a timed cache, which is usually preferable.
 
-    @property
-    def name(self) -> str:  # type: ignore
-        """The name of this application.
+        Note this is a duplicate of the same method in the Quart
+        class.
 
-        This is taken from the :attr:`import_name` and is used for
-        debugging purposes.
         """
-        if self.import_name == "__main__":
-            path = Path(getattr(sys.modules["__main__"], "__file__", "__main__.py"))
-            return path.stem
-        return self.import_name
+        value = self.config["SEND_FILE_MAX_AGE_DEFAULT"]
 
-    @property
-    def propagate_exceptions(self) -> bool:
-        """Return true if exceptions should be propagated into debug pages.
+        if value is None:
+            return None
 
-        If false the exception will be handled. See the
-        ``PROPAGATE_EXCEPTIONS`` config setting.
-        """
-        propagate = self.config["PROPAGATE_EXCEPTIONS"]
-        if propagate is not None:
-            return propagate
-        else:
-            return self.debug or self.testing
+        if isinstance(value, timedelta):
+            return int(value.total_seconds())
 
-    @property
-    def preserve_context_on_exception(self) -> bool:
-        preserve = self.config["PRESERVE_CONTEXT_ON_EXCEPTION"]
-        if preserve is not None:
-            return preserve
-        else:
-            return self.debug
+        return value
+        return None
 
-    @property
-    def logger(self) -> Logger:
-        """A :class:`logging.Logger` logger for the app.
+    async def send_static_file(self, filename: str) -> Response:
+        if not self.has_static_folder:
+            raise RuntimeError("No static folder for this object")
+        return await send_from_directory(self.static_folder, filename)
 
-        This can be used to log messages in a format as defined in the
-        app configuration, for example,
+    async def open_resource(
+        self,
+        path: FilePath,
+        mode: str = "rb",
+    ) -> AiofilesContextManager[None, None, AsyncBufferedReader]:
+        """Open a file for reading.
+
+        Use as
 
         .. code-block:: python
 
-            app.logger.debug("Request method %s", request.method)
-            app.logger.error("Error, of some kind")
-
+            async with await app.open_resource(path) as file_:
+                await file_.read()
         """
-        if self._logger is None:
-            self._logger = create_logger(self)
-        return self._logger
+        if mode not in {"r", "rb", "rt"}:
+            raise ValueError("Files can only be opened for reading")
 
-    @property
-    def jinja_env(self) -> Environment:
-        """The jinja environment used to load templates."""
-        if self._jinja_env is None:
-            self._jinja_env = self.create_jinja_environment()
-        return self._jinja_env
-
-    @property
-    def got_first_request(self) -> bool:
-        """Return if the app has received a request."""
-        return self._got_first_request
-
-    def make_aborter(self) -> Aborter:
-        """Create and return the aborter instance."""
-        return self.aborter_class()
-
-    def make_config(self, instance_relative: bool = False) -> Config:
-        """Create and return the configuration with appropriate defaults."""
-        config = self.config_class(
-            self.instance_path if instance_relative else self.root_path, DEFAULT_CONFIG
-        )
-        config["ENV"] = get_env()
-        config["DEBUG"] = get_debug_flag()
-        return config
-
-    def auto_find_instance_path(self) -> Path:
-        """Locates the instance_path if it was not provided"""
-        prefix, package_path = find_package(self.import_name)
-        if prefix is None:
-            return package_path / "instance"
-        return prefix / "var" / f"{self.name}-instance"
+        return async_open(os.path.join(self.root_path, path), mode)  # type: ignore
 
     async def open_instance_resource(
         self, path: FilePath, mode: str = "rb"
@@ -432,20 +404,7 @@ class Quart(Scaffold):
         """
         return async_open(self.instance_path / file_path_to_path(path), mode)  # type: ignore
 
-    @property
-    def templates_auto_reload(self) -> bool:
-        """Returns True if templates should auto reload."""
-        result = self.config["TEMPLATES_AUTO_RELOAD"]
-        if result is None:
-            return self.debug
-        else:
-            return result
-
-    @templates_auto_reload.setter
-    def templates_auto_reload(self, value: Optional[bool]) -> None:
-        self.config["TEMPLATES_AUTO_RELOAD"] = value
-
-    def create_jinja_environment(self) -> Environment:
+    def create_jinja_environment(self) -> Environment:  # type: ignore
         """Create and return the jinja environment.
 
         This will create the environment based on the
@@ -456,8 +415,8 @@ class Quart(Scaffold):
         if "autoescape" not in options:
             options["autoescape"] = self.select_jinja_autoescape
         if "auto_reload" not in options:
-            options["auto_reload"] = self.templates_auto_reload
-        jinja_env = self.jinja_environment(self, **options)
+            options["auto_reload"] = self.config["TEMPLATES_AUTO_RELOAD"]
+        jinja_env = self.jinja_environment(self, **options)  # type: ignore
         jinja_env.globals.update(
             {
                 "config": self.config,
@@ -470,16 +429,6 @@ class Quart(Scaffold):
         )
         jinja_env.policies["json.dumps_function"] = self.json.dumps
         return jinja_env
-
-    def create_global_jinja_loader(self) -> DispatchingJinjaLoader:
-        """Create and return a global (not blueprint specific) Jinja loader."""
-        return DispatchingJinjaLoader(self)
-
-    def select_jinja_autoescape(self, filename: str) -> bool:
-        """Returns True if the filename indicates that it should be escaped."""
-        if filename is None:
-            return True
-        return Path(filename).suffix in {".htm", ".html", ".xhtml", ".xml"}
 
     async def update_template_context(self, context: dict) -> None:
         """Update the provided template context.
@@ -499,318 +448,11 @@ class Quart(Scaffold):
         extra_context: dict = {}
         for name in names:
             for processor in self.template_context_processors[name]:
-                extra_context.update(await self.ensure_async(processor)())
+                extra_context.update(await self.ensure_async(processor)())  # type: ignore
 
         original = context.copy()
         context.update(extra_context)
         context.update(original)
-
-    def make_shell_context(self) -> dict:
-        """Create a context for interactive shell usage.
-
-        The :attr:`shell_context_processors` can be used to add
-        additional context.
-        """
-        context = {"app": self, "g": g}
-        for processor in self.shell_context_processors:
-            context.update(processor())
-        return context
-
-    @property
-    def debug(self) -> bool:
-        """Activate debug mode (extra checks, logging and reloading).
-
-        Should/must be False in production.
-        """
-        return self.config["DEBUG"]
-
-    @debug.setter
-    def debug(self, value: bool) -> None:
-        self.config["DEBUG"] = value
-        self.jinja_env.auto_reload = self.templates_auto_reload
-
-    def test_client(self, use_cookies: bool = True) -> TestClientProtocol:
-        """Creates and returns a test client."""
-        return self.test_client_class(self, use_cookies=use_cookies)
-
-    def test_cli_runner(self, **kwargs: Any) -> QuartCliRunner:
-        """Creates and returns a CLI test runner."""
-        return self.test_cli_runner_class(self, **kwargs)
-
-    @setupmethod
-    def register_blueprint(
-        self,
-        blueprint: Blueprint,
-        **options: Any,
-    ) -> None:
-        """Register a blueprint on the app.
-
-        This results in the blueprint's routes, error handlers
-        etc... being added to the app.
-
-        Arguments:
-            blueprint: The blueprint to register.
-            url_prefix: Optional prefix to apply to all paths.
-            url_defaults: Blueprint routes will use these default values for view arguments.
-            subdomain: Blueprint routes will match on this subdomain.
-        """
-        blueprint.register(self, options)
-
-    def iter_blueprints(self) -> ValuesView[Blueprint]:
-        """Return a iterator over the blueprints."""
-        return self.blueprints.values()
-
-    @setupmethod
-    def add_url_rule(
-        self,
-        rule: str,
-        endpoint: Optional[str] = None,
-        view_func: Optional[Callable] = None,
-        provide_automatic_options: Optional[bool] = None,
-        *,
-        methods: Optional[Iterable[str]] = None,
-        defaults: Optional[dict] = None,
-        host: Optional[str] = None,
-        subdomain: Optional[str] = None,
-        is_websocket: bool = False,
-        strict_slashes: Optional[bool] = None,
-        merge_slashes: Optional[bool] = None,
-    ) -> None:
-        """Add a route/url rule to the application.
-
-        This is designed to be used on the application directly. An
-        example usage,
-
-        .. code-block:: python
-
-            def route():
-                ...
-
-            app.add_url_rule('/', route)
-
-        Arguments:
-            rule: The path to route on, should start with a ``/``.
-            endpoint: Optional endpoint name, if not present the
-                function name is used.
-            view_func: Callable that returns a response.
-            provide_automatic_options: Optionally False to prevent
-                OPTION handling.
-            methods: List of HTTP verbs the function routes.
-            defaults: A dictionary of variables to provide automatically, use
-                to provide a simpler default path for a route, e.g. to allow
-                for ``/book`` rather than ``/book/0``,
-
-                .. code-block:: python
-
-                    @app.route('/book', defaults={'page': 0})
-                    @app.route('/book/<int:page>')
-                    def book(page):
-                        ...
-
-            host: The full host name for this route (should include subdomain
-                if needed) - cannot be used with subdomain.
-            subdomain: A subdomain for this specific route.
-            strict_slashes: Strictly match the trailing slash present in the
-                path. Will redirect a leaf (no slash) to a branch (with slash).
-            is_websocket: Whether or not the view_func is a websocket.
-            merge_slashes: Merge consecutive slashes to a single slash (unless
-                as part of the path variable).
-        """
-        endpoint = endpoint or _endpoint_from_view_func(view_func)
-        if methods is None:
-            methods = getattr(view_func, "methods", ["GET"])
-
-        methods = cast(Set[str], set(methods))
-        required_methods = set(getattr(view_func, "required_methods", set()))
-
-        if provide_automatic_options is None:
-            automatic_options = getattr(view_func, "provide_automatic_options", None)
-            if automatic_options is None:
-                automatic_options = "OPTIONS" not in methods
-        else:
-            automatic_options = provide_automatic_options
-
-        if automatic_options:
-            required_methods.add("OPTIONS")
-
-        methods.update(required_methods)
-
-        rule = self.url_rule_class(
-            rule,
-            methods=methods,
-            endpoint=endpoint,
-            host=host,
-            subdomain=subdomain,
-            defaults=defaults,
-            websocket=is_websocket,
-            strict_slashes=strict_slashes,
-            merge_slashes=merge_slashes,
-            provide_automatic_options=automatic_options,
-        )
-        self.url_map.add(rule)
-
-        if view_func is not None:
-            old_view_func = self.view_functions.get(endpoint)
-            if old_view_func is not None and old_view_func != view_func:
-                raise AssertionError(f"Handler is overwriting existing for endpoint {endpoint}")
-
-            self.view_functions[endpoint] = view_func
-
-    @setupmethod
-    def template_filter(
-        self, name: Optional[str] = None
-    ) -> Callable[[T_template_filter], T_template_filter]:
-        """Add a template filter.
-
-        This is designed to be used as a decorator. An example usage,
-
-        .. code-block:: python
-
-            @app.template_filter('name')
-            def to_upper(value):
-                return value.upper()
-
-        Arguments:
-            name: The filter name (defaults to function name).
-        """
-
-        def decorator(func: T_template_filter) -> T_template_filter:
-            self.add_template_filter(func, name=name)
-            return func
-
-        return decorator
-
-    @setupmethod
-    def add_template_filter(self, func: TemplateFilterCallable, name: Optional[str] = None) -> None:
-        """Add a template filter.
-
-        This is designed to be used on the application directly. An
-        example usage,
-
-        .. code-block:: python
-
-            def to_upper(value):
-                return value.upper()
-
-            app.add_template_filter(to_upper)
-
-        Arguments:
-            func: The function that is the filter.
-            name: The filter name (defaults to function name).
-        """
-        self.jinja_env.filters[name or func.__name__] = func
-
-    @setupmethod
-    def template_test(
-        self, name: Optional[str] = None
-    ) -> Callable[[T_template_test], T_template_test]:
-        """Add a template test.
-
-        This is designed to be used as a decorator. An example usage,
-
-        .. code-block:: python
-
-            @app.template_test('name')
-            def is_upper(value):
-                return value.isupper()
-
-        Arguments:
-            name: The test name (defaults to function name).
-        """
-
-        def decorator(func: T_template_test) -> T_template_test:
-            self.add_template_test(func, name=name)
-            return func
-
-        return decorator
-
-    @setupmethod
-    def add_template_test(self, func: TemplateTestCallable, name: Optional[str] = None) -> None:
-        """Add a template test.
-
-        This is designed to be used on the application directly. An
-        example usage,
-
-        .. code-block:: python
-
-            def is_upper(value):
-                return value.isupper()
-
-            app.add_template_test(is_upper)
-
-        Arguments:
-            func: The function that is the test.
-            name: The test name (defaults to function name).
-        """
-        self.jinja_env.tests[name or func.__name__] = func
-
-    @setupmethod
-    def template_global(
-        self, name: Optional[str] = None
-    ) -> Callable[[T_template_global], T_template_global]:
-        """Add a template global.
-
-        This is designed to be used as a decorator. An example usage,
-
-        .. code-block:: python
-
-            @app.template_global('name')
-            def five():
-                return 5
-
-        Arguments:
-            name: The global name (defaults to function name).
-        """
-
-        def decorator(func: T_template_global) -> T_template_global:
-            self.add_template_global(func, name=name)
-            return func
-
-        return decorator
-
-    @setupmethod
-    def add_template_global(self, func: TemplateGlobalCallable, name: Optional[str] = None) -> None:
-        """Add a template global.
-
-        This is designed to be used on the application directly. An
-        example usage,
-
-        .. code-block:: python
-
-            def five():
-                return 5
-
-            app.add_template_global(five)
-
-        Arguments:
-            func: The function that is the global.
-            name: The global name (defaults to function name).
-        """
-        self.jinja_env.globals[name or func.__name__] = func
-
-    @setupmethod
-    def before_first_request(
-        self,
-        func: T_before_first_request,
-    ) -> T_before_first_request:
-        """Add a before **first** request function.
-
-        This is designed to be used as a decorator, if used to
-        decorate a synchronous function, the function will be wrapped
-        in :func:`~quart.utils.run_sync` and run in a thread executor
-        (with the wrapped function returned). An example usage,
-
-        .. code-block:: python
-
-            @app.before_first_request
-            async def func():
-                ...
-
-        Arguments:
-            func: The before first request function itself.
-        """
-        self.before_first_request_funcs.append(func)
-        return func
 
     @setupmethod
     def before_serving(
@@ -893,7 +535,7 @@ class Quart(Scaffold):
         self.after_serving_funcs.append(func)
         return func
 
-    def create_url_adapter(self, request: Optional[BaseRequestWebsocket]) -> Optional[MapAdapter]:
+    def create_url_adapter(self, request: BaseRequestWebsocket | None) -> MapAdapter | None:
         """Create and return a URL adapter.
 
         This will create the adapter based on the request if present
@@ -904,50 +546,125 @@ class Quart(Scaffold):
                 (self.url_map.default_subdomain or None) if not self.subdomain_matching else None
             )
 
-            return self.url_map.bind_to_request(request, subdomain, self.config["SERVER_NAME"])
+            return self.url_map.bind_to_request(  # type: ignore[attr-defined]
+                request, subdomain, self.config["SERVER_NAME"]
+            )
 
         if self.config["SERVER_NAME"] is not None:
             scheme = "https" if self.config["PREFER_SECURE_URLS"] else "http"
             return self.url_map.bind(self.config["SERVER_NAME"], url_scheme=scheme)
         return None
 
-    @setupmethod
-    def shell_context_processor(self, func: T_shell_context_processor) -> T_shell_context_processor:
-        """Add a shell context processor.
+    def websocket(
+        self,
+        rule: str,
+        **options: Any,
+    ) -> Callable[[T_websocket], T_websocket]:
+        """Add a websocket to the application.
 
-        This is designed to be used as a decorator. An example usage,
+        This is designed to be used as a decorator, if used to
+        decorate a synchronous function, the function will be wrapped
+        in :func:`~quart.utils.run_sync` and run in a thread executor
+        (with the wrapped function returned). An example usage,
 
         .. code-block:: python
 
-            @app.shell_context_processor
-            def additional_context():
-                return context
+            @app.websocket('/')
+            async def websocket_route():
+                ...
 
+        Arguments:
+            rule: The path to route on, should start with a ``/``.
+            endpoint: Optional endpoint name, if not present the
+                function name is used.
+            defaults: A dictionary of variables to provide automatically, use
+                to provide a simpler default path for a route, e.g. to allow
+                for ``/book`` rather than ``/book/0``,
+
+                .. code-block:: python
+
+                    @app.websocket('/book', defaults={'page': 0})
+                    @app.websocket('/book/<int:page>')
+                    def book(page):
+                        ...
+
+            host: The full host name for this route (should include subdomain
+                if needed) - cannot be used with subdomain.
+            subdomain: A subdomain for this specific route.
+            strict_slashes: Strictly match the trailing slash present in the
+                path. Will redirect a leaf (no slash) to a branch (with slash).
         """
-        self.shell_context_processors.append(func)
-        return func
 
-    def inject_url_defaults(self, endpoint: str, values: dict) -> None:
-        """Injects default URL values into the passed values dict.
+        def decorator(func: T_websocket) -> T_websocket:
+            endpoint = options.pop("endpoint", None)
+            self.add_websocket(
+                rule,
+                endpoint,
+                func,
+                **options,
+            )
+            return func
 
-        This is used to assist when building urls, see `url_for`.
+        return decorator
+
+    def add_websocket(
+        self,
+        rule: str,
+        endpoint: str | None = None,
+        view_func: WebsocketCallable | None = None,
+        **options: Any,
+    ) -> None:
+        """Add a websocket url rule to the application.
+
+        This is designed to be used on the application directly. An
+        example usage,
+
+        .. code-block:: python
+
+            def websocket_route():
+                ...
+
+            app.add_websocket('/', websocket_route)
+
+        Arguments:
+            rule: The path to route on, should start with a ``/``.
+            endpoint: Optional endpoint name, if not present the
+                function name is used.
+            view_func: Callable that returns a response.
+            defaults: A dictionary of variables to provide automatically, use
+                to provide a simpler default path for a route, e.g. to allow
+                for ``/book`` rather than ``/book/0``,
+
+                .. code-block:: python
+
+                    @app.websocket('/book', defaults={'page': 0})
+                    @app.websocket('/book/<int:page>')
+                    def book(page):
+                        ...
+
+            host: The full host name for this route (should include subdomain
+                if needed) - cannot be used with subdomain.
+            subdomain: A subdomain for this specific route.
+            strict_slashes: Strictly match the trailing slash present in the
+                path. Will redirect a leaf (no slash) to a branch (with slash).
         """
-        names: List[Optional[str]] = [None]
-        if "." in endpoint:
-            names.extend(reversed(_split_blueprint_path(endpoint.rsplit(".", 1)[0])))
-
-        for name in names:
-            for function in self.url_default_functions[name]:
-                function(endpoint, values)
+        return self.add_url_rule(
+            rule,
+            endpoint,
+            view_func,
+            methods={"GET"},
+            websocket=True,
+            **options,
+        )
 
     def url_for(
         self,
         endpoint: str,
         *,
-        _anchor: Optional[str] = None,
-        _external: Optional[bool] = None,
-        _method: Optional[str] = None,
-        _scheme: Optional[str] = None,
+        _anchor: str | None = None,
+        _external: bool | None = None,
+        _method: str | None = None,
+        _scheme: str | None = None,
         **values: Any,
     ) -> str:
         """Return the url for a specific endpoint.
@@ -1020,49 +737,249 @@ class Quart(Scaffold):
                 url_adapter.url_scheme = old_scheme
 
         if _anchor is not None:
-            quoted_anchor = url_quote(_anchor)
+            quoted_anchor = quote(_anchor, safe="%!#$&'()*+,/:;=?@")
             url = f"{url}#{quoted_anchor}"
         return url
 
-    def handle_url_build_error(self, error: Exception, endpoint: str, values: dict) -> str:
-        """Handle a build error.
+    def make_shell_context(self) -> dict:
+        """Create a context for interactive shell usage.
 
-        Ideally this will return a valid url given the error endpoint
-        and values.
+        The :attr:`shell_context_processors` can be used to add
+        additional context.
         """
-        for handler in self.url_build_error_handlers:
-            result = handler(error, endpoint, values)
-            if result is not None:
-                return result
-        raise error
+        context = {"app": self, "g": g}
+        for processor in self.shell_context_processors:
+            context.update(processor())
+        return context
 
-    def _find_error_handler(self, error: Exception) -> Optional[ErrorHandlerCallable]:
-        error_type, error_code = self._get_error_type_and_code(type(error))
+    def run(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        debug: bool | None = None,
+        use_reloader: bool = True,
+        loop: asyncio.AbstractEventLoop | None = None,
+        ca_certs: str | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Run this application.
 
-        names = []
-        if has_request_context():
-            names.extend(request_ctx.request.blueprints)
-        elif has_websocket_context():
-            names.extend(websocket_ctx.websocket.blueprints)
-        names.append(None)
+        This is best used for development only, see Hypercorn for
+        production servers.
 
-        for code in [error_code, None]:
-            for name in names:
-                handlers = self.error_handler_spec[name].get(code)
+        Arguments:
+            host: Hostname to listen on. By default this is loopback
+                only, use 0.0.0.0 to have the server listen externally.
+            port: Port number to listen on.
+            debug: If set enable (or disable) debug mode and debug output.
+            use_reloader: Automatically reload on code changes.
+            loop: Asyncio loop to create the server in, if None, take default one.
+                If specified it is the caller's responsibility to close and cleanup the
+                loop.
+            ca_certs: Path to the SSL CA certificate file.
+            certfile: Path to the SSL certificate file.
+            keyfile: Path to the SSL key file.
+        """
+        if kwargs:
+            warnings.warn(
+                f"Additional arguments, {','.join(kwargs.keys())}, are not supported.\n"
+                "They may be supported by Hypercorn, which is the ASGI server Quart "
+                "uses by default. This method is meant for development and debugging.",
+                stacklevel=2,
+            )
 
-                if handlers is None:
-                    continue
+        if loop is None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-                for cls in error_type.__mro__:
-                    handler = handlers.get(cls)
+        if "QUART_DEBUG" in os.environ:
+            self.debug = get_debug_flag()
 
-                    if handler is not None:
-                        return handler
-        return None
+        if debug is not None:
+            self.debug = debug
+
+        loop.set_debug(self.debug)
+
+        shutdown_event = asyncio.Event()
+
+        def _signal_handler(*_: Any) -> None:
+            shutdown_event.set()
+
+        for signal_name in {"SIGINT", "SIGTERM", "SIGBREAK"}:
+            if hasattr(signal, signal_name):
+                try:
+                    loop.add_signal_handler(getattr(signal, signal_name), _signal_handler)
+                except NotImplementedError:
+                    # Add signal handler may not be implemented on Windows
+                    signal.signal(getattr(signal, signal_name), _signal_handler)
+
+        server_name = self.config.get("SERVER_NAME")
+        sn_host = None
+        sn_port = None
+        if server_name is not None:
+            sn_host, _, sn_port = server_name.partition(":")
+
+        if host is None:
+            host = sn_host or "127.0.0.1"
+
+        if port is None:
+            port = int(sn_port or "5000")
+
+        task = self.run_task(
+            host,
+            port,
+            debug,
+            ca_certs,
+            certfile,
+            keyfile,
+            shutdown_trigger=shutdown_event.wait,  # type: ignore
+        )
+        print(f" * Serving Quart app '{self.name}'")  # noqa: T201
+        print(f" * Debug mode: {self.debug or False}")  # noqa: T201
+        print(" * Please use an ASGI server (e.g. Hypercorn) directly in production")  # noqa: T201
+        scheme = "https" if certfile is not None and keyfile is not None else "http"
+        print(f" * Running on {scheme}://{host}:{port} (CTRL + C to quit)")  # noqa: T201
+
+        tasks = [loop.create_task(task)]
+
+        if use_reloader:
+            tasks.append(loop.create_task(observe_changes(asyncio.sleep, shutdown_event)))
+
+        reload_ = False
+        try:
+            loop.run_until_complete(asyncio.gather(*tasks))
+        except MustReloadError:
+            reload_ = True
+        finally:
+            try:
+                _cancel_all_tasks(loop)
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+        if reload_:
+            restart()
+
+    def run_task(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 5000,
+        debug: bool | None = None,
+        ca_certs: str | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+        shutdown_trigger: Callable[..., Awaitable[None]] | None = None,
+    ) -> Coroutine[None, None, None]:
+        """Return a task that when awaited runs this application.
+
+        This is best used for development only, see Hypercorn for
+        production servers.
+
+        Arguments:
+            host: Hostname to listen on. By default this is loopback
+                only, use 0.0.0.0 to have the server listen externally.
+            port: Port number to listen on.
+            debug: If set enable (or disable) debug mode and debug output.
+            ca_certs: Path to the SSL CA certificate file.
+            certfile: Path to the SSL certificate file.
+            keyfile: Path to the SSL key file.
+
+        """
+        config = HyperConfig()
+        config.access_log_format = "%(h)s %(r)s %(s)s %(b)s %(D)s"
+        config.accesslog = "-"
+        config.bind = [f"{host}:{port}"]
+        config.ca_certs = ca_certs
+        config.certfile = certfile
+        if debug is not None:
+            self.debug = debug
+        config.errorlog = config.accesslog
+        config.keyfile = keyfile
+
+        return serve(self, config, shutdown_trigger=shutdown_trigger)
+
+    def test_client(self, use_cookies: bool = True, **kwargs: Any) -> TestClientProtocol:
+        """Creates and returns a test client."""
+        return self.test_client_class(self, use_cookies=use_cookies, **kwargs)
+
+    def test_cli_runner(self, **kwargs: Any) -> QuartCliRunner:
+        """Creates and returns a CLI test runner."""
+        return self.test_cli_runner_class(self, **kwargs)  # type: ignore
+
+    @setupmethod
+    def before_websocket(
+        self,
+        func: T_before_websocket,
+    ) -> T_before_websocket:
+        """Add a before websocket function.
+
+        This is designed to be used as a decorator, if used to
+        decorate a synchronous function, the function will be wrapped
+        in :func:`~quart.utils.run_sync` and run in a thread executor
+        (with the wrapped function returned). An example usage,
+
+        .. code-block:: python
+
+            @app.before_websocket
+            async def func():
+                ...
+
+        Arguments:
+            func: The before websocket function itself.
+        """
+        self.before_websocket_funcs[None].append(func)
+        return func
+
+    @setupmethod
+    def after_websocket(
+        self,
+        func: T_after_websocket,
+    ) -> T_after_websocket:
+        """Add an after websocket function.
+
+        This is designed to be used as a decorator, if used to
+        decorate a synchronous function, the function will be wrapped
+        in :func:`~quart.utils.run_sync` and run in a thread executor
+        (with the wrapped function returned). An example usage,
+
+        .. code-block:: python
+
+            @app.after_websocket
+            async def func(response):
+                return response
+
+        Arguments:
+            func: The after websocket function itself.
+        """
+        self.after_websocket_funcs[None].append(func)
+        return func
+
+    @setupmethod
+    def teardown_websocket(
+        self,
+        func: T_teardown,
+    ) -> T_teardown:
+        """Add a teardown websocket function.
+        This is designed to be used as a decorator, if used to
+        decorate a synchronous function, the function will be wrapped
+        in :func:`~quart.utils.run_sync` and run in a thread executor
+        (with the wrapped function returned). An example usage,
+        .. code-block:: python
+            @app.teardown_websocket
+            async def func():
+                ...
+        Arguments:
+            func: The teardown websocket function itself.
+        """
+        self.teardown_websocket_funcs[None].append(func)
+        return func
 
     async def handle_http_exception(
         self, error: HTTPException
-    ) -> Union[HTTPException, ResponseReturnValue]:
+    ) -> HTTPException | ResponseReturnValue:
         """Handle a HTTPException subclass error.
 
         This will attempt to find a handler for the error and if fails
@@ -1074,91 +991,112 @@ class Quart(Scaffold):
         if isinstance(error, RoutingException):
             return error
 
-        handler = self._find_error_handler(error)
+        blueprints = []
+        if has_request_context():
+            blueprints = request.blueprints
+        elif has_websocket_context():
+            blueprints = websocket.blueprints
+
+        handler = self._find_error_handler(error, blueprints)
         if handler is None:
-            return error.get_response()
+            return error
         else:
-            return await self.ensure_async(handler)(error)
+            return await self.ensure_async(handler)(error)  # type: ignore
 
-    def trap_http_exception(self, error: Exception) -> bool:
-        """Check it error is http and should be trapped.
-
-        Trapped errors are not handled by the
-        :meth:`handle_http_exception`, but instead trapped by the
-        outer most (or user handlers). This can be useful when
-        debugging to allow tracebacks to be viewed by the debug page.
-        """
-        return self.config["TRAP_HTTP_EXCEPTIONS"]
-
-    async def handle_user_exception(
-        self, error: Exception
-    ) -> Union[HTTPException, ResponseReturnValue]:
+    async def handle_user_exception(self, error: Exception) -> HTTPException | ResponseReturnValue:
         """Handle an exception that has been raised.
 
         This should forward :class:`~quart.exception.HTTPException` to
         :meth:`handle_http_exception`, then attempt to handle the
         error. If it cannot it should reraise the error.
         """
+        if isinstance(error, BadRequestKeyError) and (
+            self.debug or self.config["TRAP_BAD_REQUEST_ERRORS"]
+        ):
+            error.show_exception = True
+
         if isinstance(error, HTTPException) and not self.trap_http_exception(error):
             return await self.handle_http_exception(error)
 
-        handler = self._find_error_handler(error)
+        blueprints = []
+        if has_request_context():
+            blueprints = request.blueprints
+        elif has_websocket_context():
+            blueprints = websocket.blueprints
+
+        handler = self._find_error_handler(error, blueprints)
         if handler is None:
             raise error
-        return await self.ensure_async(handler)(error)
+        return await self.ensure_async(handler)(error)  # type: ignore
 
-    async def handle_exception(self, error: Exception) -> Union[Response, WerkzeugResponse]:
+    async def handle_exception(self, error: Exception) -> ResponseTypes:
         """Handle an uncaught exception.
 
         By default this switches the error response to a 500 internal
         server error.
         """
-        await got_request_exception.send(self, exception=error)
+        exc_info = sys.exc_info()
+        await got_request_exception.send_async(
+            self, _sync_wrapper=self.ensure_async, exception=error  # type: ignore
+        )
+        propagate = self.config["PROPAGATE_EXCEPTIONS"]
 
-        self.log_exception(sys.exc_info())
+        if propagate is None:
+            propagate = self.testing or self.debug
 
-        if self.propagate_exceptions:
+        if propagate:
+            # Re-raise if called with an active exception, otherwise
+            # raise the passed in exception.
+            if exc_info[1] is error:
+                raise
+
             raise error
 
-        internal_server_error = InternalServerError(original_exception=error)
-        handler = self._find_error_handler(internal_server_error)
+        self.log_exception(exc_info)
+        server_error: InternalServerError | ResponseReturnValue
+        server_error = InternalServerError(original_exception=error)
+        handler = self._find_error_handler(server_error, request.blueprints)
 
-        response: Union[Response, WerkzeugResponse, InternalServerError]
         if handler is not None:
-            response = await self.ensure_async(handler)(internal_server_error)
-        else:
-            response = internal_server_error
+            server_error = await self.ensure_async(handler)(server_error)  # type: ignore
 
-        return await self.finalize_request(response, from_error_handler=True)
+        return await self.finalize_request(server_error, from_error_handler=True)
 
-    async def handle_websocket_exception(
-        self, error: Exception
-    ) -> Optional[Union[Response, WerkzeugResponse]]:
+    async def handle_websocket_exception(self, error: Exception) -> ResponseTypes | None:
         """Handle an uncaught exception.
 
         By default this logs the exception and then re-raises it.
         """
-        await got_websocket_exception.send(self, exception=error)
+        exc_info = sys.exc_info()
+        await got_websocket_exception.send_async(
+            self, _sync_wrapper=self.ensure_async, exception=error  # type: ignore
+        )
+        propagate = self.config["PROPAGATE_EXCEPTIONS"]
 
-        self.log_exception(sys.exc_info())
+        if propagate is None:
+            propagate = self.testing or self.debug
 
-        if self.propagate_exceptions:
+        if propagate:
+            # Re-raise if called with an active exception, otherwise
+            # raise the passed in exception.
+            if exc_info[1] is error:
+                raise
+
             raise error
 
-        internal_server_error = InternalServerError(original_exception=error)
-        handler = self._find_error_handler(internal_server_error)
+        self.log_exception(exc_info)
+        server_error: InternalServerError | ResponseReturnValue
+        server_error = InternalServerError(original_exception=error)
+        handler = self._find_error_handler(server_error, websocket.blueprints)
 
-        response: Union[Response, WerkzeugResponse, InternalServerError]
         if handler is not None:
-            response = await self.ensure_async(handler)(internal_server_error)
-        else:
-            response = internal_server_error
+            server_error = await self.ensure_async(handler)(server_error)  # type: ignore
 
-        return await self.finalize_websocket(response, from_error_handler=True)
+        return await self.finalize_websocket(server_error, from_error_handler=True)
 
     def log_exception(
         self,
-        exception_info: Union[Tuple[type, BaseException, TracebackType], Tuple[None, None, None]],
+        exception_info: tuple[type, BaseException, TracebackType] | tuple[None, None, None],
     ) -> None:
         """Log a exception to the :attr:`logger`.
 
@@ -1175,35 +1113,15 @@ class Quart(Scaffold):
         else:
             self.logger.error("Exception", exc_info=exception_info)
 
-    def raise_routing_exception(self, request: BaseRequestWebsocket) -> NoReturn:
-        raise request.routing_exception
+    @overload
+    def ensure_async(self, func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]: ...
 
-    @setupmethod
-    def teardown_appcontext(
-        self,
-        func: T_teardown,
-    ) -> T_teardown:
-        """Add a teardown app (context) function.
+    @overload
+    def ensure_async(self, func: Callable[P, T]) -> Callable[P, Awaitable[T]]: ...
 
-        This is designed to be used as a decorator, if used to
-        decorate a synchronous function, the function will be wrapped
-        in :func:`~quart.utils.run_sync` and run in a thread executor
-        (with the wrapped function returned). An example usage,
-
-        .. code-block:: python
-
-            @app.teardown_appcontext
-            async def func():
-                ...
-
-        Arguments:
-            func: The teardown function itself.
-            name: Optional blueprint key name.
-        """
-        self.teardown_appcontext_funcs.append(func)
-        return func
-
-    def ensure_async(self, func: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
+    def ensure_async(
+        self, func: Union[Callable[P, Awaitable[T]], Callable[P, T]]
+    ) -> Callable[P, Awaitable[T]]:
         """Ensure that the returned func is async and calls the func.
 
         .. versionadded:: 0.11
@@ -1212,12 +1130,12 @@ class Quart(Scaffold):
         run. Before Quart 0.11 this did not run the synchronous code
         in an executor.
         """
-        if is_coroutine_function(func):
+        if asyncio.iscoroutinefunction(func):
             return func
         else:
-            return self.sync_to_async(func)
+            return self.sync_to_async(cast(Callable[P, T], func))
 
-    def sync_to_async(self, func: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
+    def sync_to_async(self, func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
         """Return a async function that will run the synchronous function *func*.
 
         This can be used as so,::
@@ -1230,7 +1148,7 @@ class Quart(Scaffold):
         return run_sync(func)
 
     async def do_teardown_request(
-        self, exc: Optional[BaseException], request_context: Optional[RequestContext] = None
+        self, exc: BaseException | None, request_context: RequestContext | None = None
     ) -> None:
         """Teardown the request, calling the teardown functions.
 
@@ -1242,13 +1160,15 @@ class Quart(Scaffold):
         """
         names = [*(request_context or request_ctx).request.blueprints, None]
         for name in names:
-            for function in self.teardown_request_funcs[name]:
+            for function in reversed(self.teardown_request_funcs[name]):
                 await self.ensure_async(function)(exc)
 
-        await request_tearing_down.send(self, exc=exc)
+        await request_tearing_down.send_async(
+            self, _sync_wrapper=self.ensure_async, exc=exc  # type: ignore
+        )
 
     async def do_teardown_websocket(
-        self, exc: Optional[BaseException], websocket_context: Optional[WebsocketContext] = None
+        self, exc: BaseException | None, websocket_context: WebsocketContext | None = None
     ) -> None:
         """Teardown the websocket, calling the teardown functions.
 
@@ -1260,16 +1180,20 @@ class Quart(Scaffold):
         """
         names = [*(websocket_context or websocket_ctx).websocket.blueprints, None]
         for name in names:
-            for function in self.teardown_websocket_funcs[name]:
+            for function in reversed(self.teardown_websocket_funcs[name]):
                 await self.ensure_async(function)(exc)
 
-        await websocket_tearing_down.send(self, exc=exc)
+        await websocket_tearing_down.send_async(
+            self, _sync_wrapper=self.ensure_async, exc=exc  # type: ignore
+        )
 
-    async def do_teardown_appcontext(self, exc: Optional[BaseException]) -> None:
+    async def do_teardown_appcontext(self, exc: BaseException | None) -> None:
         """Teardown the app (context), calling the teardown functions."""
         for function in self.teardown_appcontext_funcs:
             await self.ensure_async(function)(exc)
-        await appcontext_tearing_down.send(self, exc=exc)
+        await appcontext_tearing_down.send_async(
+            self, _sync_wrapper=self.ensure_async, exc=exc  # type: ignore
+        )
 
     def app_context(self) -> AppContext:
         """Create and return an app context.
@@ -1315,163 +1239,6 @@ class Quart(Scaffold):
         """
         return WebsocketContext(self, websocket)
 
-    def run(
-        self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        debug: Optional[bool] = None,
-        use_reloader: bool = True,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
-        ca_certs: Optional[str] = None,
-        certfile: Optional[str] = None,
-        keyfile: Optional[str] = None,
-        **kwargs: Any,
-    ) -> None:
-        """Run this application.
-
-        This is best used for development only, see Hypercorn for
-        production servers.
-
-        Arguments:
-            host: Hostname to listen on. By default this is loopback
-                only, use 0.0.0.0 to have the server listen externally.
-            port: Port number to listen on.
-            debug: If set enable (or disable) debug mode and debug output.
-            use_reloader: Automatically reload on code changes.
-            loop: Asyncio loop to create the server in, if None, take default one.
-                If specified it is the caller's responsibility to close and cleanup the
-                loop.
-            ca_certs: Path to the SSL CA certificate file.
-            certfile: Path to the SSL certificate file.
-            keyfile: Path to the SSL key file.
-        """
-        if kwargs:
-            warnings.warn(
-                f"Additional arguments, {','.join(kwargs.keys())}, are not supported.\n"
-                "They may be supported by Hypercorn, which is the ASGI server Quart "
-                "uses by default. This method is meant for development and debugging."
-            )
-
-        if loop is None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if "QUART_ENV" in os.environ:
-            self.env = get_env()
-            self.debug = get_debug_flag()
-        elif "QUART_DEBUG" in os.environ:
-            self.debug = get_debug_flag()
-
-        if debug is not None:
-            self.debug = debug
-
-        loop.set_debug(self.debug)
-
-        shutdown_event = asyncio.Event()
-
-        def _signal_handler(*_: Any) -> None:
-            shutdown_event.set()
-
-        for signal_name in {"SIGINT", "SIGTERM", "SIGBREAK"}:
-            if hasattr(signal, signal_name):
-                try:
-                    loop.add_signal_handler(getattr(signal, signal_name), _signal_handler)
-                except NotImplementedError:
-                    # Add signal handler may not be implemented on Windows
-                    signal.signal(getattr(signal, signal_name), _signal_handler)
-
-        server_name = self.config.get("SERVER_NAME")
-        sn_host = None
-        sn_port = None
-        if server_name is not None:
-            sn_host, _, sn_port = server_name.partition(":")
-
-        if host is None:
-            host = sn_host or "127.0.0.1"
-
-        if port is None:
-            port = int(sn_port or "5000")
-
-        task = self.run_task(
-            host,
-            port,
-            debug,
-            ca_certs,
-            certfile,
-            keyfile,
-            shutdown_trigger=shutdown_event.wait,  # type: ignore
-        )
-        print(f" * Serving Quart app '{self.name}'")  # noqa: T201
-        print(f" * Environment: {self.env}")  # noqa: T201
-        if self.env == "production":
-            print(  # noqa: T201
-                " * Please use an ASGI server (e.g. Hypercorn) directly in production"
-            )
-        print(f" * Debug mode: {self.debug or False}")  # noqa: T201
-        scheme = "https" if certfile is not None and keyfile is not None else "http"
-        print(f" * Running on {scheme}://{host}:{port} (CTRL + C to quit)")  # noqa: T201
-
-        tasks = [loop.create_task(task)]
-        if platform.system() == "Windows":
-            tasks.append(loop.create_task(_windows_signal_support()))
-
-        if use_reloader:
-            tasks.append(loop.create_task(observe_changes(asyncio.sleep, shutdown_event)))
-
-        reload_ = False
-        try:
-            loop.run_until_complete(asyncio.gather(*tasks))
-        except MustReloadError:
-            reload_ = True
-        finally:
-            try:
-                _cancel_all_tasks(loop)
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                asyncio.set_event_loop(None)
-                loop.close()
-
-        if reload_:
-            restart()
-
-    def run_task(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 5000,
-        debug: Optional[bool] = None,
-        ca_certs: Optional[str] = None,
-        certfile: Optional[str] = None,
-        keyfile: Optional[str] = None,
-        shutdown_trigger: Optional[Callable[..., Awaitable[None]]] = None,
-    ) -> Coroutine[None, None, None]:
-        """Return a task that when awaited runs this application.
-
-        This is best used for development only, see Hypercorn for
-        production servers.
-
-        Arguments:
-            host: Hostname to listen on. By default this is loopback
-                only, use 0.0.0.0 to have the server listen externally.
-            port: Port number to listen on.
-            debug: If set enable (or disable) debug mode and debug output.
-            ca_certs: Path to the SSL CA certificate file.
-            certfile: Path to the SSL certificate file.
-            keyfile: Path to the SSL key file.
-
-        """
-        config = HyperConfig()
-        config.access_log_format = "%(h)s %(r)s %(s)s %(b)s %(D)s"
-        config.accesslog = "-"
-        config.bind = [f"{host}:{port}"]
-        config.ca_certs = ca_certs
-        config.certfile = certfile
-        if debug is not None:
-            self.debug = debug
-        config.errorlog = config.accesslog
-        config.keyfile = keyfile
-
-        return serve(self, config, shutdown_trigger=shutdown_trigger)
-
     def test_app(self) -> TestAppProtocol:
         return self.test_app_class(self)
 
@@ -1480,18 +1247,18 @@ class Quart(Scaffold):
         path: str,
         *,
         method: str = "GET",
-        headers: Optional[Union[dict, Headers]] = None,
-        query_string: Optional[dict] = None,
+        headers: dict | Headers | None = None,
+        query_string: dict | None = None,
         scheme: str = "http",
         send_push_promise: Callable[[str, Headers], Awaitable[None]] = no_op_push,
-        data: Optional[AnyStr] = None,
-        form: Optional[dict] = None,
+        data: AnyStr | None = None,
+        form: dict | None = None,
         json: Any = sentinel,
         root_path: str = "",
         http_version: str = "1.1",
-        scope_base: Optional[dict] = None,
-        auth: Optional[Union[Authorization, Tuple[str, str]]] = None,
-        subdomain: Optional[str] = None,
+        scope_base: dict | None = None,
+        auth: Authorization | tuple[str, str] | None = None,
+        subdomain: str | None = None,
     ) -> RequestContext:
         """Create a request context for testing purposes.
 
@@ -1550,49 +1317,28 @@ class Quart(Scaffold):
     def add_background_task(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         async def _wrapper() -> None:
             try:
-                await copy_current_app_context(self.ensure_async(func))(*args, **kwargs)
+                async with self.app_context():
+                    await self.ensure_async(func)(*args, **kwargs)
             except Exception as error:
                 await self.handle_background_exception(error)
 
         task = asyncio.get_event_loop().create_task(_wrapper())
         self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
 
     async def handle_background_exception(self, error: Exception) -> None:
-        await got_background_exception.send(self, exception=error)
+        await got_background_exception.send_async(
+            self, _sync_wrapper=self.ensure_async, exception=error  # type: ignore
+        )
 
         self.log_exception(sys.exc_info())
-
-    async def try_trigger_before_first_request_functions(self) -> None:
-        """Trigger the before first request methods."""
-        if self._got_first_request:
-            return
-
-        # Reverse the teardown functions, so as to match the expected usage
-        self.teardown_appcontext_funcs = list(reversed(self.teardown_appcontext_funcs))
-        for key, value in self.teardown_request_funcs.items():
-            self.teardown_request_funcs[key] = list(reversed(value))
-        for key, value in self.teardown_websocket_funcs.items():
-            self.teardown_websocket_funcs[key] = list(reversed(value))
-
-        async with self._first_request_lock:
-            if self._got_first_request:
-                return
-            for function in self.before_first_request_funcs:
-                await self.ensure_async(function)()
-            self._got_first_request = True
-
-    def redirect(self, location: str, code: int = 302) -> WerkzeugResponse:
-        """Create a redirect response object."""
-        return werkzeug_redirect(location, code=code, Response=self.response_class)  # type: ignore
 
     async def make_default_options_response(self) -> Response:
         """This is the default route function for OPTIONS requests."""
         methods = request_ctx.url_adapter.allowed_methods()
         return self.response_class("", headers={"Allow": ", ".join(methods)})
 
-    async def make_response(
-        self, result: Union[ResponseReturnValue, HTTPException]
-    ) -> Union[Response, WerkzeugResponse]:
+    async def make_response(self, result: ResponseReturnValue | HTTPException) -> ResponseTypes:
         """Make a Response from the result of the route handler.
 
         The result itself can either be:
@@ -1602,24 +1348,31 @@ class Quart(Scaffold):
 
         A ResponseValue is either a Response object (or subclass) or a str.
         """
-        status_or_headers: Optional[Union[StatusCode, HeadersValue]] = None
-        headers: Optional[HeadersValue] = None
-        status: Optional[StatusCode] = None
+        headers: HeadersValue | None = None
+        status: StatusCode | None = None
         if isinstance(result, tuple):
-            value, status_or_headers, headers = result + (None,) * (3 - len(result))
+            if len(result) == 3:
+                value, status, headers = result
+            elif len(result) == 2:
+                value, status_or_headers = result
+
+                if isinstance(status_or_headers, (Headers, dict, list)):
+                    headers = status_or_headers
+                    status = None
+                elif status_or_headers is not None:
+                    status = status_or_headers  # type: ignore[assignment]
+            else:
+                raise TypeError(
+                    """The response value returned must be either (body, status), (body,
+                    headers), or (body, status, headers)"""
+                )
         else:
-            value = result
+            value = result  # type: ignore[assignment]
 
         if value is None:
             raise TypeError("The response value returned by the view function cannot be None")
 
-        if isinstance(status_or_headers, (Headers, dict, list)):
-            headers = status_or_headers
-            status = None
-        elif status_or_headers is not None:
-            status = status_or_headers
-
-        response: Union[Response, WerkzeugResponse]
+        response: ResponseTypes
         if isinstance(value, HTTPException):
             response = value.get_response()  # type: ignore
         elif not isinstance(value, (Response, WerkzeugResponse)):
@@ -1628,9 +1381,9 @@ class Quart(Scaffold):
                 or isgenerator(value)
                 or isasyncgen(value)
             ):
-                response = self.response_class(value)  # type: ignore
+                response = self.response_class(value)
             elif isinstance(value, (list, dict)):
-                response = self.json.response(value)
+                response = self.json.response(value)  # type: ignore[assignment]
             else:
                 raise TypeError(f"The response value type ({type(value).__name__}) is not valid")
         else:
@@ -1640,11 +1393,11 @@ class Quart(Scaffold):
             response.status_code = int(status)
 
         if headers is not None:
-            response.headers.update(headers)  # type: ignore
+            response.headers.update(headers)  # type: ignore[arg-type]
 
         return response
 
-    async def handle_request(self, request: Request) -> Union[Response, WerkzeugResponse]:
+    async def handle_request(self, request: Request) -> ResponseTypes:
         async with self.request_context(request) as request_context:
             try:
                 return await self.full_dispatch_request(request_context)
@@ -1656,18 +1409,31 @@ class Quart(Scaffold):
                 if request.scope.get("_quart._preserve_context", False):
                     self._preserved_context = request_context.copy()
 
+    async def handle_websocket(self, websocket: Websocket) -> ResponseTypes | None:
+        async with self.websocket_context(websocket) as websocket_context:
+            try:
+                return await self.full_dispatch_websocket(websocket_context)
+            except asyncio.CancelledError:
+                raise  # CancelledErrors should be handled by serving code.
+            except Exception as error:
+                return await self.handle_websocket_exception(error)
+            finally:
+                if websocket.scope.get("_quart._preserve_context", False):
+                    self._preserved_context = websocket_context.copy()
+
     async def full_dispatch_request(
-        self, request_context: Optional[RequestContext] = None
-    ) -> Union[Response, WerkzeugResponse]:
+        self, request_context: RequestContext | None = None
+    ) -> ResponseTypes:
         """Adds pre and post processing to the request dispatching.
 
         Arguments:
             request_context: The request context, optional as Flask
                 omits this argument.
         """
-        await self.try_trigger_before_first_request_functions()
-        await request_started.send(self)
         try:
+            await request_started.send_async(self, _sync_wrapper=self.ensure_async)  # type: ignore
+
+            result: ResponseReturnValue | HTTPException | None
             result = await self.preprocess_request(request_context)
             if result is None:
                 result = await self.dispatch_request(request_context)
@@ -1675,9 +1441,31 @@ class Quart(Scaffold):
             result = await self.handle_user_exception(error)
         return await self.finalize_request(result, request_context)
 
+    async def full_dispatch_websocket(
+        self, websocket_context: WebsocketContext | None = None
+    ) -> ResponseTypes | None:
+        """Adds pre and post processing to the websocket dispatching.
+
+        Arguments:
+            websocket_context: The websocket context, optional to match
+                the Flask convention.
+        """
+        try:
+            await websocket_started.send_async(
+                self, _sync_wrapper=self.ensure_async  # type: ignore
+            )
+
+            result: ResponseReturnValue | HTTPException | None
+            result = await self.preprocess_websocket(websocket_context)
+            if result is None:
+                result = await self.dispatch_websocket(websocket_context)
+        except Exception as error:
+            result = await self.handle_user_exception(error)
+        return await self.finalize_websocket(result, websocket_context)
+
     async def preprocess_request(
-        self, request_context: Optional[RequestContext] = None
-    ) -> Optional[ResponseReturnValue]:
+        self, request_context: RequestContext | None = None
+    ) -> ResponseReturnValue | None:
         """Preprocess the request i.e. call before_request functions.
 
         Arguments:
@@ -1694,111 +1482,13 @@ class Quart(Scaffold):
             for function in self.before_request_funcs[name]:
                 result = await self.ensure_async(function)()
                 if result is not None:
-                    return result
+                    return result  # type: ignore
 
         return None
 
-    async def dispatch_request(
-        self, request_context: Optional[RequestContext] = None
-    ) -> ResponseReturnValue:
-        """Dispatch the request to the view function.
-
-        Arguments:
-            request_context: The request context, optional as Flask
-                omits this argument.
-        """
-        request_ = (request_context or request_ctx).request
-        if request_.routing_exception is not None:
-            self.raise_routing_exception(request_)
-
-        if request_.method == "OPTIONS" and request_.url_rule.provide_automatic_options:
-            return await self.make_default_options_response()
-
-        handler = self.view_functions[request_.url_rule.endpoint]
-        return await self.ensure_async(handler)(**request_.view_args)
-
-    async def finalize_request(
-        self,
-        result: Union[ResponseReturnValue, HTTPException],
-        request_context: Optional[RequestContext] = None,
-        from_error_handler: bool = False,
-    ) -> Union[Response, WerkzeugResponse]:
-        """Turns the view response return value into a response.
-
-        Arguments:
-            result: The result of the request to finalize into a response.
-            request_context: The request context, optional as Flask
-                omits this argument.
-        """
-        response = await self.make_response(result)
-        try:
-            response = await self.process_response(response, request_context)
-            await request_finished.send(self, response=response)
-        except Exception:
-            if not from_error_handler:
-                raise
-            self.logger.exception("Request finalizing errored")
-        return response
-
-    async def process_response(
-        self,
-        response: Union[Response, WerkzeugResponse],
-        request_context: Optional[RequestContext] = None,
-    ) -> Union[Response, WerkzeugResponse]:
-        """Postprocess the request acting on the response.
-
-        Arguments:
-            response: The response after the request is finalized.
-            request_context: The request context, optional as Flask
-                omits this argument.
-        """
-        names = [*(request_context or request_ctx).request.blueprints, None]
-
-        for function in (request_context or request_ctx)._after_request_functions:
-            response = await self.ensure_async(function)(response)
-
-        for name in names:
-            for function in reversed(self.after_request_funcs[name]):
-                response = await self.ensure_async(function)(response)
-
-        session_ = (request_context or request_ctx).session
-        if not self.session_interface.is_null_session(session_):
-            await self.ensure_async(self.session_interface.save_session)(self, session_, response)
-        return response
-
-    async def handle_websocket(
-        self, websocket: Websocket
-    ) -> Optional[Union[Response, WerkzeugResponse]]:
-        async with self.websocket_context(websocket) as websocket_context:
-            try:
-                return await self.full_dispatch_websocket(websocket_context)
-            except asyncio.CancelledError:
-                raise  # CancelledErrors should be handled by serving code.
-            except Exception as error:
-                return await self.handle_websocket_exception(error)
-
-    async def full_dispatch_websocket(
-        self, websocket_context: Optional[WebsocketContext] = None
-    ) -> Optional[Union[Response, WerkzeugResponse]]:
-        """Adds pre and post processing to the websocket dispatching.
-
-        Arguments:
-            websocket_context: The websocket context, optional to match
-                the Flask convention.
-        """
-        await self.try_trigger_before_first_request_functions()
-        await websocket_started.send(self)
-        try:
-            result = await self.preprocess_websocket(websocket_context)
-            if result is None:
-                result = await self.dispatch_websocket(websocket_context)
-        except Exception as error:
-            result = await self.handle_user_exception(error)
-        return await self.finalize_websocket(result, websocket_context)
-
     async def preprocess_websocket(
-        self, websocket_context: Optional[WebsocketContext] = None
-    ) -> Optional[ResponseReturnValue]:
+        self, websocket_context: WebsocketContext | None = None
+    ) -> ResponseReturnValue | None:
         """Preprocess the websocket i.e. call before_websocket functions.
 
         Arguments:
@@ -1818,13 +1508,35 @@ class Quart(Scaffold):
             for function in self.before_websocket_funcs[name]:
                 result = await self.ensure_async(function)()
                 if result is not None:
-                    return result
+                    return result  # type: ignore
 
         return None
 
+    def raise_routing_exception(self, request: BaseRequestWebsocket) -> NoReturn:
+        raise request.routing_exception
+
+    async def dispatch_request(
+        self, request_context: RequestContext | None = None
+    ) -> ResponseReturnValue:
+        """Dispatch the request to the view function.
+
+        Arguments:
+            request_context: The request context, optional as Flask
+                omits this argument.
+        """
+        request_ = (request_context or request_ctx).request
+        if request_.routing_exception is not None:
+            self.raise_routing_exception(request_)
+
+        if request_.method == "OPTIONS" and request_.url_rule.provide_automatic_options:
+            return await self.make_default_options_response()
+
+        handler = self.view_functions[request_.url_rule.endpoint]
+        return await self.ensure_async(handler)(**request_.view_args)  # type: ignore
+
     async def dispatch_websocket(
-        self, websocket_context: Optional[WebsocketContext] = None
-    ) -> Optional[ResponseReturnValue]:
+        self, websocket_context: WebsocketContext | None = None
+    ) -> ResponseReturnValue | None:
         """Dispatch the websocket to the view function.
 
         Arguments:
@@ -1836,14 +1548,39 @@ class Quart(Scaffold):
             self.raise_routing_exception(websocket_)
 
         handler = self.view_functions[websocket_.url_rule.endpoint]
-        return await self.ensure_async(handler)(**websocket_.view_args)
+        return await self.ensure_async(handler)(**websocket_.view_args)  # type: ignore
+
+    async def finalize_request(
+        self,
+        result: ResponseReturnValue | HTTPException,
+        request_context: RequestContext | None = None,
+        from_error_handler: bool = False,
+    ) -> ResponseTypes:
+        """Turns the view response return value into a response.
+
+        Arguments:
+            result: The result of the request to finalize into a response.
+            request_context: The request context, optional as Flask
+                omits this argument.
+        """
+        response = await self.make_response(result)
+        try:
+            response = await self.process_response(response, request_context)
+            await request_finished.send_async(
+                self, _sync_wrapper=self.ensure_async, response=response  # type: ignore
+            )
+        except Exception:
+            if not from_error_handler:
+                raise
+            self.logger.exception("Request finalizing errored")
+        return response
 
     async def finalize_websocket(
         self,
-        result: ResponseReturnValue,
-        websocket_context: Optional[WebsocketContext] = None,
+        result: ResponseReturnValue | HTTPException,
+        websocket_context: WebsocketContext | None = None,
         from_error_handler: bool = False,
-    ) -> Optional[Union[Response, WerkzeugResponse]]:
+    ) -> ResponseTypes | None:
         """Turns the view response return value into a response.
 
         Arguments:
@@ -1857,18 +1594,46 @@ class Quart(Scaffold):
             response = None
         try:
             response = await self.postprocess_websocket(response, websocket_context)
-            await websocket_finished.send(self, response=response)
+            await websocket_finished.send_async(
+                self, _sync_wrapper=self.ensure_async, response=response  # type: ignore
+            )
         except Exception:
             if not from_error_handler:
                 raise
             self.logger.exception("Request finalizing errored")
         return response
 
+    async def process_response(
+        self,
+        response: ResponseTypes,
+        request_context: RequestContext | None = None,
+    ) -> ResponseTypes:
+        """Postprocess the request acting on the response.
+
+        Arguments:
+            response: The response after the request is finalized.
+            request_context: The request context, optional as Flask
+                omits this argument.
+        """
+        names = [*(request_context or request_ctx).request.blueprints, None]
+
+        for function in (request_context or request_ctx)._after_request_functions:
+            response = await self.ensure_async(function)(response)  # type: ignore
+
+        for name in names:
+            for function in reversed(self.after_request_funcs[name]):
+                response = await self.ensure_async(function)(response)
+
+        session_ = (request_context or request_ctx).session
+        if not self.session_interface.is_null_session(session_):
+            await self.ensure_async(self.session_interface.save_session)(self, session_, response)
+        return response
+
     async def postprocess_websocket(
         self,
-        response: Optional[Union[Response, WerkzeugResponse]],
-        websocket_context: Optional[WebsocketContext] = None,
-    ) -> Union[Response, WerkzeugResponse]:
+        response: ResponseTypes | None,
+        websocket_context: WebsocketContext | None = None,
+    ) -> ResponseTypes:
         """Postprocess the websocket acting on the response.
 
         Arguments:
@@ -1879,11 +1644,11 @@ class Quart(Scaffold):
         names = [*(websocket_context or websocket_ctx).websocket.blueprints, None]
 
         for function in (websocket_context or websocket_ctx)._after_websocket_functions:
-            response = await self.ensure_async(function)(response)
+            response = await self.ensure_async(function)(response)  # type: ignore
 
         for name in names:
             for function in reversed(self.after_websocket_funcs[name]):
-                response = await self.ensure_async(function)(response)
+                response = await self.ensure_async(function)(response)  # type: ignore
 
         session_ = (websocket_context or websocket_ctx).session
         if not self.session_interface.is_null_session(session_):
@@ -1916,7 +1681,7 @@ class Quart(Scaffold):
             app.asgi_app = middleware(app.asgi_app)
 
         """
-        asgi_handler: Union[ASGIHTTPProtocol, ASGILifespanProtocol, ASGIWebsocketProtocol]
+        asgi_handler: ASGIHTTPProtocol | ASGILifespanProtocol | ASGIWebsocketProtocol
         if scope["type"] == "http":
             asgi_handler = self.asgi_http_class(self, scope)
         elif scope["type"] == "websocket":
@@ -1928,8 +1693,7 @@ class Quart(Scaffold):
         await asgi_handler(receive, send)
 
     async def startup(self) -> None:
-        self._got_first_request = False
-
+        self.shutdown_event = self.event_class()
         try:
             async with self.app_context():
                 for func in self.before_serving_funcs:
@@ -1937,11 +1701,22 @@ class Quart(Scaffold):
                 for gen in self.while_serving_gens:
                     await gen.__anext__()
         except Exception as error:
-            await got_serving_exception.send(self, exception=error)
+            await got_serving_exception.send_async(
+                self, _sync_wrapper=self.ensure_async, exception=error  # type: ignore
+            )
             self.log_exception(sys.exc_info())
             raise
 
     async def shutdown(self) -> None:
+        self.shutdown_event.set()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.background_tasks),
+                timeout=self.config["BACKGROUND_TASK_SHUTDOWN_TIMEOUT"],
+            )
+        except asyncio.TimeoutError:
+            await cancel_tasks(self.background_tasks)
+
         try:
             async with self.app_context():
                 for func in self.after_serving_funcs:
@@ -1954,11 +1729,11 @@ class Quart(Scaffold):
                     else:
                         raise RuntimeError("While serving generator didn't terminate")
         except Exception as error:
-            await got_serving_exception.send(self, exception=error)
+            await got_serving_exception.send_async(
+                self, _sync_wrapper=self.ensure_async, exception=error  # type: ignore
+            )
             self.log_exception(sys.exc_info())
             raise
-
-        await asyncio.gather(*self.background_tasks)
 
 
 def _cancel_all_tasks(loop: asyncio.AbstractEventLoop) -> None:
@@ -1979,11 +1754,3 @@ def _cancel_all_tasks(loop: asyncio.AbstractEventLoop) -> None:
                     "task": task,
                 }
             )
-
-
-async def _windows_signal_support() -> None:
-    # See https://bugs.python.org/issue23057, to catch signals on
-    # Windows it is necessary for an IO event to happen periodically.
-    # Fixed by Python 3.8
-    while True:
-        await asyncio.sleep(1)

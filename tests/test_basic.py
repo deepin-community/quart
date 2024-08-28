@@ -44,9 +44,9 @@ def app() -> Quart:
         abort(409)
         return "OK"
 
-    @app.route("/param/<param>")
-    async def param() -> ResponseReturnValue:
-        return param
+    @app.route("/param/<value>")
+    async def param(value: str) -> ResponseReturnValue:
+        return value
 
     @app.route("/stream")
     async def stream() -> ResponseReturnValue:
@@ -54,7 +54,7 @@ def app() -> Quart:
             yield "Hello "
             yield "World"
 
-        return _gen()
+        return _gen()  # type: ignore
 
     @app.errorhandler(409)
     async def generic_http_handler(_: Exception) -> ResponseReturnValue:
@@ -107,21 +107,21 @@ async def test_json(app: Quart) -> None:
     test_client = app.test_client()
     response = await test_client.post("/json/", json={"value": "json"})
     assert response.status_code == 200
-    assert b'{"value":"json"}' == (await response.get_data())  # type: ignore
+    assert b'{"value":"json"}\n' == (await response.get_data())  # type: ignore
 
 
 async def test_implicit_json(app: Quart) -> None:
     test_client = app.test_client()
     response = await test_client.post("/implicit_json/", json={"value": "json"})
     assert response.status_code == 200
-    assert b'{"value":"json"}' == (await response.get_data())  # type: ignore
+    assert b'{"value":"json"}\n' == (await response.get_data())  # type: ignore
 
 
 async def test_implicit_json_list(app: Quart) -> None:
     test_client = app.test_client()
     response = await test_client.post("/implicit_json/", json=["a", 2])
     assert response.status_code == 200
-    assert b'["a",2]' == (await response.get_data())  # type: ignore
+    assert b'["a",2]\n' == (await response.get_data())  # type: ignore
 
 
 async def test_werkzeug(app: Quart) -> None:
@@ -141,7 +141,7 @@ async def test_generic_error(app: Quart) -> None:
 async def test_url_defaults(app: Quart) -> None:
     @app.url_defaults
     def defaults(_: str, values: dict) -> None:
-        values["param"] = "hello"
+        values["value"] = "hello"
 
     async with app.test_request_context("/"):
         assert url_for("param") == "/param/hello"
@@ -159,6 +159,7 @@ async def test_make_response_str(app: Quart) -> None:
     assert response.status_code == 200
     assert (await response.get_data()) == b"Result"  # type: ignore
 
+    response = await app.make_response(("Result", 200))
     response = await app.make_response(("Result", {"name": "value"}))
     assert response.status_code == 200
     assert (await response.get_data()) == b"Result"  # type: ignore
@@ -184,6 +185,15 @@ async def test_make_response_response(app: Quart) -> None:
     assert response.status_code == 404
     assert (await response.get_data()) == b"Result"  # type: ignore
     assert response.headers["name"] == "value"
+
+
+async def test_make_response_errors(app: Quart) -> None:
+    with pytest.raises(TypeError):
+        await app.make_response(("Result", {"name": "value"}, 200))  # type: ignore
+    with pytest.raises(TypeError):
+        await app.make_response(("Result", {"name": "value"}, 200, "a"))  # type: ignore
+    with pytest.raises(TypeError):
+        await app.make_response(("Result",))  # type: ignore
 
 
 async def test_websocket(app: Quart) -> None:
