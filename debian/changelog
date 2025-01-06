@@ -1,3 +1,19 @@
+quart (0.20.0-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+
+ -- Colin Watson <cjwatson@debian.org>  Mon, 23 Dec 2024 21:50:47 +0000
+
+quart (0.19.9-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release:
+    - CVE-2024-49767: Fix how `max_form_memory_size` is applied when parsing
+      large non-file fields (closes: #1086063).
+
+ -- Colin Watson <cjwatson@debian.org>  Sun, 17 Nov 2024 15:07:18 +0100
+
 quart (0.19.6-1) unstable; urgency=medium
 
   * Team upload
